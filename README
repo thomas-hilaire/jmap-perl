@@ -16,3 +16,11 @@ thread support, meaning that threading does not need to be calculated locally.
 NOTE: this library does not ship with the cloned FastMail web interface which
 is running on https://proxy.jmap.io/.  The licencing situation for that code is
 not yet resolved.
+
+Run in docker
+=============
+
+    docker build -t jmap-perl .
+    docker run --name jmap-proxy --rm -ti jmap-perl
+
+That's it!
