@@ -3,23 +3,23 @@ Debian install instructions (port to your own OS as you like)
 # Might need some software too
 
 apt-get install build-essential \
-		libanyevent-httpd-perl \
-		libdata-uuid-libuuid-perl \
-		libdatetime-perl \
-		libdbd-sqlite3-perl \
-		libdbi-perl \
-		libemail-address-perl \
-		libemail-mime-perl \
-		libhtml-parser-perl \
-		libhtml-strip-perl \
-		libhttp-tiny-perl \
-		libhttp-date-perl \
-		libimage-size-perl \
-		libio-socket-ssl-perl \
-		libjson-perl \
-		libjson-xs-perl \
-		liblocale-gettext-perl \
-		libswitch-perl
+                libanyevent-httpd-perl \
+                libdata-uuid-libuuid-perl \
+                libdatetime-perl \
+                libdbd-sqlite3-perl \
+                libdbi-perl \
+                libemail-address-perl \
+                libemail-mime-perl \
+                libhtml-parser-perl \
+                libhtml-strip-perl \
+                libhttp-tiny-perl \
+                libhttp-date-perl \
+                libimage-size-perl \
+                libio-socket-ssl-perl \
+                libjson-perl \
+                libjson-xs-perl \
+                liblocale-gettext-perl \
+                libswitch-perl
 
 cpan AnyEvent::HTTPD::CookiePatch
 cpan AnyEvent::IMAP
@@ -40,7 +40,7 @@ config.example to config.json and replace XXX and YYY with your details.
 
 Replace /etc/nginx/sites-available/default with the a symlink to nginx.conf
 
-Run bin/blocking.pl in one screen
+Run bin/apiendpoint.pl in one screen
 Run bin/server.pl in another screen
 
 There's various stuff hard coded too, oh well

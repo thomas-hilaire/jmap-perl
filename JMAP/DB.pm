@@ -9,7 +9,9 @@ use Data::Dumper;
 use DBI;
 use Carp qw(confess);
 
-use JSON::XS qw(encode_json decode_json);
+use Data::UUID::LibUUID;
+use IO::LockedFile;
+use JSON::XS qw(decode_json);
 use Email::MIME;
 # seriously, it's parsable, get over it
 $Email::MIME::ContentType::STRICT_PARAMS = 0;
@@ -20,12 +22,31 @@ use Encode;
 use Encode::MIME::Header;
 use DateTime;
 use Date::Parse;
+use Net::CalDAVTalk;
+use Net::CardDAVTalk::VCard;
+use MIME::Base64 qw(encode_base64 decode_base64);
+
+my $json = JSON::XS->new->utf8->canonical();
+
+my %TABLE2GROUPS = (
+  jmessages => ['Message', 'Thread'],
+  jmailboxes => ['Mailbox'],
+  jmessagemap => ['Mailbox'],
+  jrawmessage => [],
+  jfiles => [], # for now
+  jcalendars => ['Calendar'],
+  jevents => ['CalendarEvent'],
+  jaddressbooks => [], # not directly
+  jcontactgroups => ['ContactGroup'],
+  jcontactgroupmap => ['ContactGroup'],
+  jcontacts => ['Contact'],
+);
 
 sub new {
   my $class = shift;
   my $accountid = shift || die;
+  my $Self = bless { accountid => $accountid, start => time() }, ref($class) || $class;
   my $dbh = DBI->connect("dbi:SQLite:dbname=/home/jmap/data/$accountid.sqlite3");
-  my $Self = bless { accountid => $accountid, dbh => $dbh, start => time() }, ref($class) || $class;
   $Self->_initdb($dbh);
   return $Self;
 }
@@ -57,32 +78,65 @@ sub log {
 
 sub dbh {
   my $Self = shift;
-  return $Self->{dbh};
+  confess("NOT IN TRANSACTION") unless $Self->{t};
+  return $Self->{t}{dbh};
+}
+
+sub in_transaction {
+  my $Self = shift;
+  return $Self->{t} ? 1 : 0;
+}
+
+sub begin_superlock {
+  my $Self = shift;
+  my $accountid = $Self->accountid();
+  $Self->{superlock} = IO::LockedFile->new(">/home/jmap/data/$accountid.lock");
+}
+
+sub end_superlock {
+  my $Self = shift;
+  delete $Self->{superlock};
 }
 
 sub begin {
   my $Self = shift;
   confess("ALREADY IN TRANSACTION") if $Self->{t};
-  $Self->dbh->begin_work();
-  $Self->{t} = {};
+  my $accountid = $Self->accountid();
+  # we need this because sqlite locking isn't as robust as you might hope
+  $Self->{t} = {lock => $Self->{superlock} || IO::LockedFile->new(">/home/jmap/data/$accountid.lock")};
+  $Self->{t}{dbh} = DBI->connect("dbi:SQLite:dbname=/home/jmap/data/$accountid.sqlite3");
+  $Self->{t}{dbh}->begin_work();
 }
 
 sub commit {
   my $Self = shift;
   confess("NOT IN TRANSACTION") unless $Self->{t};
-  $Self->dbh->commit();
-  my $t = delete $Self->{t};
 
   # push an update if anything to tell..
+  my $t = $Self->{t};
   if ($t->{modseq} and $Self->{change_cb}) {
-    $Self->{change_cb}->($Self, "$t->{modseq}"); # aka stateString
+    my %map;
+    my %dbdata = (jhighestmodseq => $t->{modseq});
+    my $state = "$t->{modseq}";
+    foreach my $table (keys %{$t->{tables}}) {
+      foreach my $group (@{$TABLE2GROUPS{$table}}) {
+        $map{$group} = $state;
+        $dbdata{"jstate$group"} = $state;
+      }
+    }
+
+    $Self->dupdate('account', \%dbdata);
+    $Self->{change_cb}->($Self, \%map) unless $Self->{t}->{backfilling};
   }
+
+  $Self->{t}{dbh}->commit();
+  delete $Self->{t};
 }
 
 sub rollback {
   my $Self = shift;
   confess("NOT IN TRANSACTION") unless $Self->{t};
-  $Self->dbh->rollback();
+  $Self->{t}{dbh}->rollback();
   delete $Self->{t};
 }
 
@@ -90,28 +144,27 @@ sub rollback {
 sub reset {
   my $Self = shift;
   return unless $Self->{t};
-  $Self->dbh->rollback();
+  $Self->{t}{dbh}->rollback();
   delete $Self->{t};
 }
 
 sub dirty {
   my $Self = shift;
-  confess("NOT IN TRANSACTION") unless $Self->{t};
+  my $table = shift || die 'need to have a table to dirty';
   unless ($Self->{t}{modseq}) {
     my $user = $Self->get_user();
     $user->{jhighestmodseq}++;
-    $Self->dbh->do("UPDATE account SET jhighestmodseq = ?", {}, $user->{jhighestmodseq});
     $Self->{t}{modseq} = $user->{jhighestmodseq};
     $Self->log('debug', "dirty at $user->{jhighestmodseq}");
   }
+  $Self->{t}{tables}{$table} = $Self->{t}{modseq};
   return $Self->{t}{modseq};
 }
 
 sub get_user {
   my $Self = shift;
-  confess("NOT IN TRANSACTION") unless $Self->{t};
   unless ($Self->{t}{user}) {
-    $Self->{t}{user} = $Self->dbh->selectrow_hashref("SELECT email,displayname,picture,jhighestmodseq,jdeletedmodseq FROM account");
+    $Self->{t}{user} = $Self->dbh->selectrow_hashref("SELECT * FROM account");
   }
   # bootstrap
   unless ($Self->{t}{user}) {
@@ -124,80 +177,13 @@ sub get_user {
   return $Self->{t}{user};
 }
 
-sub get_mailboxes {
-  my $Self = shift;
-  confess("NOT IN TRANSACTION") unless $Self->{t};
-  unless ($Self->{t}{mailboxes}) {
-    $Self->{t}{mailboxes} = $Self->dbh->selectall_hashref("SELECT jmailboxid, jmodseq, label, name, parentid, nummessages, numumessages, numthreads, numuthreads, active FROM jmailboxes", 'jmailboxid', {Slice => {}});
-  }
-  return $Self->{t}{mailboxes};
-}
-
-sub get_mailbox {
-  my $Self = shift;
-  my $jmailboxid = shift;
-  return $Self->get_mailboxes->{$jmailboxid};
-}
-
-sub add_mailbox {
-  my $Self = shift;
-  my ($name, $label, $parentid) = @_;
-
-  my $mailboxes = $Self->get_mailboxes();
-
-  confess("ALREADY EXISTS $name in $parentid") if grep { $_->{name} eq $name and $_->{parentid} == $parentid } values %$mailboxes;
-
-  my $data = {
-    name => $name,
-    label => $label,
-    parentid => $parentid,
-    nummessages => 0,
-    numthreads => 0,
-    numumessages => 0,
-    numuthreads => 0,
-    active => 1,
-  };
-
-  my $id = $data->{jmailboxid} = $Self->dinsert('jmailboxes', $data);
-  $Self->{t}{mailboxes}{$id} = $data;
-
-  return $id;
-}
-
-sub update_mailbox {
-  my $Self = shift;
-  my $jmailboxid = shift;
-  my $fields = shift;
-
-  my $mailbox = $Self->get_mailbox($jmailboxid);
-  confess("INVALID ID $jmailboxid") unless $mailbox;
-  confess("NOT ACTIVE $jmailboxid") unless $mailbox->{active};
-
-  foreach my $key (keys %$fields) {
-    $mailbox->{$key} = $fields->{$key};
-  }
-
-  unless ($mailbox->{active}) {
-    # XXX - sanity check all?
-    confess("Still messages") if $mailbox->{nummessages};
-  }
-
-  $Self->dmaybedirty('jmailboxes', $mailbox, {jmailboxid => $jmailboxid});
-}
-
-sub delete_mailbox {
-  my $Self = shift;
-  my $jmailboxid = shift;
-  return $Self->update_mailbox($jmailboxid, {active => 0});
-}
-
 sub add_message {
   my $Self = shift;
   my ($data, $mailboxes) = @_;
 
   return unless @$mailboxes; # no mailboxes, no message
 
-  $Self->dmake('jmessages', $data, $Self->{backfilling});
+  $Self->dmake('jmessages', $data);
   foreach my $mailbox (@$mailboxes) {
     $Self->add_message_to_mailbox($data->{msgid}, $mailbox);
   }
@@ -212,37 +198,6 @@ sub add_message_to_mailbox {
   $Self->dmaybeupdate('jmailboxes', {jcountsmodseq => $data->{jmodseq}}, {jmailboxid => $jmailboxid});
 }
 
-sub get_raw_message {
-  my $Self = shift;
-  my $rfc822 = shift;
-  my $part = shift;
-
-  return ('message/rfc822', $rfc822) unless $part;
-
-  my $eml = Email::MIME->new($rfc822);
-  return find_part($eml, $part);
-}
-
-sub add_raw_message {
-  my $Self = shift;
-  my $msgid = shift;
-  my $rfc822 = shift;
-
-  my $eml = Email::MIME->new($rfc822);
-  my $message = $Self->parse_message($msgid, $eml);
-
-  # fiddle the top-level fields
-  my $data = {
-    msgid => $msgid,
-    rfc822 => $rfc822,
-    parsed => encode_json($message),
-  };
-
-  $Self->dinsert('jrawmessage', $data);
-
-  return $message;
-}
-
 sub parse_date {
   my $Self = shift;
   my $date = shift;
@@ -250,9 +205,8 @@ sub parse_date {
 }
 
 sub isodate {
-  my $Selft = shift;
-  my $epoch = shift;
-  return unless $epoch; # no 1970, punk
+  my $Self = shift;
+  my $epoch = shift || time();
 
   my $date = DateTime->from_epoch( epoch => $epoch );
   return $date->iso8601();
@@ -263,7 +217,7 @@ sub parse_emails {
   my $emails = shift;
 
   my @addrs = eval { Email::Address->parse($emails) };
-  return map { { name => Encode::decode_utf8($_->name()), email => $_->address() } } @addrs;
+  return map { { name => Encode::decode('MIME-Header', $_->name()), email => $_->address() } } @addrs;
 }
 
 sub parse_message {
@@ -287,8 +241,8 @@ sub parse_message {
     bcc => [$Self->parse_emails($eml->header('Bcc'))],
     from => [$Self->parse_emails($eml->header('From'))]->[0],
     replyTo => [$Self->parse_emails($eml->header('Reply-To'))]->[0],
-    subject => decode('MIME-Header', $eml->header('Subject')),
-    date => $Self->isodate($Self->parse_date($eml->header('Date'))),
+    subject => scalar(decode('MIME-Header', $eml->header('Subject'))),
+    date => scalar($Self->isodate($Self->parse_date($eml->header('Date')))),
     preview => $preview,
     textBody => $textpart,
     htmlBody => $htmlpart,
@@ -312,25 +266,6 @@ sub headers {
   return \%data;
 }
 
-sub find_part {
-  my $eml = shift;
-  my $target = shift;
-  my $part = shift;
-  my $num = 0;
-  foreach my $sub ($eml->subparts()) {
-    $num++;
-    my $id = $part ? "$part.$num" : $num;
-    my $type = $sub->content_type();
-    $type =~ s/;.*//;
-    return ($type, $sub->body()) if ($id eq $target);
-    if ($type =~ m{^multipart/}) {
-      my @res = find_part($sub, $id);
-      return @res if @res;
-    }
-  }
-  return ();
-}
-
 sub attachments {
   my $Self = shift;
   my $messageid = shift;
@@ -339,6 +274,19 @@ sub attachments {
   my $messages = shift;
   my $num = 0;
   my @res;
+
+  my $draftatt = $eml->header('X-JMAP-Draft-Attachments');
+  if ($draftatt) {
+    eval {
+      my $json = decode_base64($draftatt);
+      my $attach = decode_json($json);
+      push @res, @$attach;
+    };
+    if ($@) {
+      warn "FAILED TO PARSE $draftatt => $@";
+    }
+  }
+
   foreach my $sub ($eml->subparts()) {
     $num++;
     my $type = $sub->content_type();
@@ -384,13 +332,15 @@ sub attachments {
     push @res, {
       id => $id,
       type => $type,
-      url => "https://proxy.jmap.io/raw/$accountid/$messageid/$id/$filename",
+      url => "https://$ENV{jmaphost}/raw/$accountid/m-$messageid-$id/$filename", # XXX dep
+      blobId => "m-$messageid-$id",
       name => $filename,
       size => length($body),
       isInline => $isInline,
       %extra,
     };
   }
+
   return @res;
 }
 
@@ -402,11 +352,18 @@ sub _clean {
   return $text;
 }
 
+sub _body_str {
+  my $eml = shift;
+  my $str = eval { $eml->body_str() };
+  return $str if $str;
+  return Encode::decode('us-ascii', $eml->body_raw());
+}
+
 sub textpart {
   my $eml = shift;
   my $type = $eml->content_type() || 'text/plain';
   if ($type =~ m{^text/plain}i) {
-    return _clean($type, $eml->body_str());
+    return _clean($type, _body_str($eml));
   }
   foreach my $sub ($eml->subparts()) {
     my $res = textpart($sub);
@@ -419,7 +376,7 @@ sub htmlpart {
   my $eml = shift;
   my $type = $eml->content_type() || 'text/plain';
   if ($type =~ m{^text/html}i) {
-    return _clean($type, $eml->body_str());
+    return _clean($type, _body_str($eml));
   }
   foreach my $sub ($eml->subparts()) {
     my $res = htmlpart($sub);
@@ -440,11 +397,11 @@ sub preview {
   my $eml = shift;
   my $type = $eml->content_type() || 'text/plain';
   if ($type =~ m{text/plain}i) {
-    my $text = _clean($type, $eml->body_str());
+    my $text = _clean($type, _body_str($eml));
     return make_preview($text);
   }
   if ($type =~ m{text/html}i) {
-    my $text = _clean($type, $eml->body_str());
+    my $text = _clean($type, _body_str($eml));
     return make_preview(htmltotext($text));
   }
   foreach my $sub ($eml->subparts()) {
@@ -464,6 +421,7 @@ sub hasatt {
   my $eml = shift;
   my $type = $eml->content_type() || 'text/plain';
   return 1 if $type =~ m{(image|video|application)/};
+  return 1 if $eml->header('X-JMAP-Draft-Attachments');
   foreach my $sub ($eml->subparts()) {
     my $res = hasatt($sub);
     return $res if $res;
@@ -476,7 +434,7 @@ sub delete_message_from_mailbox {
   my ($msgid, $jmailboxid) = @_;
 
   my $data = {active => 0};
-  $Self->ddirty('jmessagemap', $data, {msgid => $msgid, jmailboxid => $jmailboxid});
+  $Self->dmaybedirty('jmessagemap', $data, {msgid => $msgid, jmailboxid => $jmailboxid});
   $Self->dmaybeupdate('jmailboxes', {jcountsmodseq => $data->{jmodseq}}, {jmailboxid => $jmailboxid});
 }
 
@@ -484,10 +442,7 @@ sub change_message {
   my $Self = shift;
   my ($msgid, $data, $newids) = @_;
 
-  # doesn't work if only IDs have changed :( 
-  #return unless $Self->dmaybedirty('jmessages', $data, {msgid => $msgid});
-
-  $Self->ddirty('jmessages', $data, {msgid => $msgid});
+  my $bump = $Self->dmaybedirty('jmessages', $data, {msgid => $msgid});
 
   my $oldids = $Self->dbh->selectcol_arrayref("SELECT jmailboxid FROM jmessagemap WHERE msgid = ? AND active = 1", {}, $msgid);
   my %old = map { $_ => 1 } @$oldids;
@@ -495,7 +450,7 @@ sub change_message {
   foreach my $jmailboxid (@$newids) {
     if (delete $old{$jmailboxid}) {
       # just bump the modseq
-      $Self->dmaybeupdate('jmailboxes', {jcountsmodseq => $data->{jmodseq}}, {jmailboxid => $jmailboxid});
+      $Self->dmaybeupdate('jmailboxes', {jcountsmodseq => $data->{jmodseq}}, {jmailboxid => $jmailboxid}) if $bump;
     }
     else {
       $Self->add_message_to_mailbox($msgid, $jmailboxid);
@@ -525,26 +480,97 @@ sub _mkemail {
 sub _makemsg {
   my $Self = shift;
   my $args = shift;
+  my $isDraft = shift;
 
-  my %replyHeaders;
-  if ($args->{inReplyToMessageId}) {
-    # XXX - get replyheaders
+  my $header = [
+    From => _mkone($args->{from}),
+    To => _mkemail($args->{to}),
+    Cc => _mkemail($args->{cc}),
+    Bcc => _mkemail($args->{bcc}),
+    Subject => $args->{subject},
+    Date => Date::Format::time2str("%a, %d %b %Y %H:%M:%S %z", $args->{msgdate}),
+    'Message-Id' => $args->{msgmessageid},
+    %{$args->{headers} || {}},
+  ];
+
+  # massive switch
+  my $MIME;
+  my $htmlpart;
+  my $text = $args->{textBody} ? $args->{textBody} : JMAP::DB::htmltotext($args->{htmlBody});
+  my $textpart = Email::MIME->create(
+    attributes => {
+      content_type => 'text/plain',
+      charset => 'UTF-8',
+    },
+    body => $text,
+  );
+  if ($args->{htmlBody}) {
+    $htmlpart = Email::MIME->create(
+      attributes => {
+        content_type => 'text/html',
+        charset => 'UTF-8',
+      },
+      body => $args->{htmlBody},
+    );
   }
 
-  my $MIME = Email::Simple->create(
-    header => [
-      From => _mkone($args->{from}),
-      To => _mkemail($args->{to}),
-      Cc => _mkemail($args->{cc}),
-      Bcc => _mkemail($args->{bcc}),
-      Subject => $args->{subject},
-      %{$args->{headers} || {}},
-    ],
-    body => $args->{textBody} || $args->{htmlBody},
-  );
-  # XXX - attachments
+  my @attachments = $args->{attachments} ? @{$args->{attachments}} : ();
 
-  return $MIME->as_string();
+  if (@attachments and not $isDraft) {
+    my $encoded = encode_base64($json->encode(\@attachments), '');
+    push @$header, "X-JMAP-Draft-Attachments" => $encoded;
+    @attachments = ();
+  }
+
+  if (@attachments) {
+    # most complex case
+    if ($htmlpart) {
+      my $msgparts = Email::MIME->create(
+        attributes => {
+          content_type => 'multipart/alternative'
+        },
+        parts => [$textpart, $htmlpart],
+      );
+      # XXX - attachments
+      $MIME = Email::MIME->create(
+        header_str => [@$header, 'Content-Type' => 'multipart/mixed'],
+        parts => [$msgparts],
+      );
+    }
+    else {
+      # XXX - attachments
+      $MIME = Email::MIME->create(
+        header_str => [@$header, 'Content-Type' => 'multipart/mixed'],
+        parts => [$textpart],
+      );
+    }
+  }
+  else {
+    if ($htmlpart) {
+      $MIME = Email::MIME->create(
+        attributes => {
+          content_type => 'multipart/alternative',
+        },
+        header_str => $header,
+        parts => [$textpart, $htmlpart],
+      );
+    }
+    else {
+      $MIME = Email::MIME->create(
+        attributes => {
+          content_type => 'text/plain',
+          charset => 'UTF-8',
+        },
+        header_str => $header,
+        body => $args->{textBody},
+      );
+    }
+  }
+
+  my $res = $MIME->as_string();
+  $res =~ s/\r?\n/\r\n/gs;
+
+  return $res;
 }
 
 # NOTE: this can ONLY be used to create draft messages
@@ -554,15 +580,37 @@ sub create_messages {
   my %created;
   my %notCreated;
 
-  my $dbh = $Self->dbh();
+  return ({}, {}) unless %$args;
+
+  $Self->begin();
 
   # XXX - get draft mailbox ID
-  my ($draftid) = $dbh->selectrow_array("SELECT jmailboxid FROM jmailboxes WHERE role = ?", {}, "drafts");
+  my ($draftid) = $Self->dbh->selectrow_array("SELECT jmailboxid FROM jmailboxes WHERE role = ?", {}, "drafts");
 
+  my %todo;
   foreach my $cid (keys %$args) {
     my $item = $args->{$cid};
+    if ($item->{inReplyToMessageId}) {
+      my ($replymessageid) = $Self->dbh->selectrow_array("SELECT msgmessageid FROM jmessages WHERE msgid = ?", {}, $item->{inReplyToMessageId});
+      unless ($replymessageid) {
+        $notCreated{$cid} = 'inReplyToNotFound';
+        next;
+      }
+      $item->{headers}{'In-Reply-To'} = $replymessageid;
+      $item->{headers}{'References'} = $replymessageid;
+      # XXX - references
+    }
+    $item->{msgdate} = time();
+    $item->{msgmessageid} = new_uuid_string() . "\@$ENV{jmaphost}";
     my $message = $Self->_makemsg($item);
     # XXX - let's just assume goodness for now - lots of error handling to add
+    $todo{$cid} = $message;
+  }
+
+  $Self->commit();
+
+  foreach my $cid (keys %todo) {
+    my $message = $todo{$cid};
     my ($msgid, $thrid) = $Self->import_message($message, [$draftid],
       isUnread => 0,
       isAnswered => 0,
@@ -584,7 +632,7 @@ sub update_messages {
   die "Virtual method";
 }
 
-sub delete_messages {
+sub destroy_messages {
   my $Self = shift;
   die "Virtual method";
 }
@@ -607,7 +655,111 @@ sub report_messages {
   return ($msgids, []);
 }
 
-sub create_file {
+sub parse_event {
+  my $Self = shift;
+  my $raw = shift;
+  my $CalDAV = Net::CalDAVTalk->new(url => 'http://localhost/');  # empty caldav
+  my ($event) = $CalDAV->vcalendarToEvents($raw);
+  return $event;
+}
+
+sub set_event {
+  my $Self = shift;
+  my $jcalendarid = shift;
+  my $event = shift;
+  my $eventuid = delete $event->{uid};
+  $Self->dmake('jevents', {
+    eventuid => $eventuid,
+    jcalendarid => $jcalendarid,
+    payload => $json->encode($event),
+  });
+}
+
+sub delete_event {
+  my $Self = shift;
+  my $jcalendarid = shift; # doesn't matter
+  my $eventuid = shift;
+  return $Self->dmaybedirty('jevents', {active => 0}, {eventuid => $eventuid});
+}
+
+sub parse_card {
+  my $Self = shift;
+  my $raw = shift;
+  my ($card) = Net::CardDAVTalk::VCard->new_fromstring($raw);
+
+  my %hash;
+
+  $hash{uid} = $card->uid();
+  $hash{kind} = $card->VKind();
+
+  if ($hash{kind} eq 'contact') {
+    $hash{lastName} = $card->VLastName();
+    $hash{firstName} = $card->VFirstName();
+    $hash{prefix} = $card->VTitle();
+
+    $hash{company} = $card->VCompany();
+    $hash{department} = $card->VDepartment();
+
+    $hash{emails} = [$card->VEmails()];
+    $hash{addresses} = [$card->VAddresses()];
+    $hash{phones} = [$card->VPhones()];
+    $hash{online} = [$card->VOnline()];
+  
+    $hash{nickname} = $card->VNickname();
+    $hash{birthday} = $card->VBirthday();
+    $hash{notes} = $card->VNotes();
+  }
+  else {
+    $hash{name} = $card->VFN();
+    $hash{members} = [$card->VGroupContactUIDs()];
+  }
+
+  return \%hash;
+}
+
+sub set_card {
+  my $Self = shift;
+  my $jaddressbookid = shift;
+  my $card = shift;
+  my $carduid = delete $card->{uid};
+  my $kind = delete $card->{kind};
+  if ($kind eq 'contact') {
+    $Self->dmake('jcontacts', {
+      contactuid => $carduid,
+      jaddressbookid => $jaddressbookid,
+      payload => $json->encode($card),
+    });
+  }
+  else {
+    $Self->dmake('jcontactgroups', {
+      groupuid => $carduid,
+      jaddressbookid => $jaddressbookid,
+      name => $card->{name},
+    });
+    $Self->ddelete('jcontactgroupmap', {groupuid => $carduid});
+    foreach my $item (@{$card->{members}}) {
+      $Self->dinsert('jcontactgroupmap', {
+        groupuid => $carduid,
+        contactuid => $item,
+      });
+    }
+  }
+}
+
+sub delete_card {
+  my $Self = shift;
+  my $jaddressbookid = shift; # doesn't matter
+  my $carduid = shift;
+  my $kind = shift;
+  if ($kind eq 'contact') {
+    $Self->dmaybedirty('jcontacts', {active => 0}, {contactuid => $carduid, jaddressbookid => $jaddressbookid});
+  }
+  else {
+    $Self->dmaybedirty('jcontactgroups', {active => 0}, {groupuid => $carduid, jaddressbookid => $jaddressbookid});
+  }
+}
+
+sub put_file {
   my $Self = shift;
   my $type = shift;
   my $content = shift;
@@ -615,13 +767,17 @@ sub create_file {
 
   my $size = length($content);
 
+  $Self->begin();
+
   # XXX - no dedup on sha1 here yet
   my $id = $Self->dinsert('jfiles', { type => $type, size => $size, content => $content, expires => $expires });
 
+  $Self->commit();
+
   return {
-    id => $id,
+    id => "$id",
     type => $type,
-    expires => $expires,
+    expires => scalar($Self->isodate($expires)),
     size => $size,
   };
 }
@@ -643,8 +799,6 @@ sub dinsert {
   my $Self = shift;
   my ($table, $values) = @_;
 
-  confess("NOT IN TRANSACTION") unless $Self->{t};
-
   $values->{mtime} = time();
 
   my @keys = sort keys %$values;
@@ -661,8 +815,10 @@ sub dinsert {
 # dinsert with a modseq
 sub dmake {
   my $Self = shift;
-  my ($table, $values, $backfilling) = @_;
-  $values->{jmodseq} = $backfilling ? 1 : $Self->dirty();
+  my ($table, $values) = @_;
+  my $modseq = $Self->dirty($table);
+  $values->{jcreated} = $modseq;
+  $values->{jmodseq} = $modseq;
   $values->{active} = 1;
   return $Self->dinsert($table, $values);
 }
@@ -676,9 +832,10 @@ sub dupdate {
   $values->{mtime} = time();
 
   my @keys = sort keys %$values;
-  my @lkeys = sort keys %$limit;
+  my @lkeys = $limit ? sort keys %$limit : ();
 
-  my $sql = "UPDATE $table SET " . join (', ', map { "$_ = ?" } @keys) . " WHERE " . join(' AND ', map { "$_ = ?" } @lkeys);
+  my $sql = "UPDATE $table SET " . join (', ', map { "$_ = ?" } @keys);
+  $sql .= " WHERE " . join(' AND ', map { "$_ = ?" } @lkeys) if @lkeys;
 
   $Self->log('debug', $sql, _dbl(map { $values->{$_} } @keys), _dbl(map { $limit->{$_} } @lkeys));
 
@@ -689,13 +846,15 @@ sub filter_values {
   my $Self = shift;
   my ($table, $values, $limit) = @_;
 
-  # copy so we don't edit the original
-  my %values = %$values;
+  # copy so we don't edit the originals
+  my %values = $values ? %$values : ();
 
-  my @keys = sort keys %$values;
-  my @lkeys = sort keys %$limit;
+  my @keys = sort keys %values;
+  my @lkeys = $limit ? sort keys %$limit : ();
 
-  my $sql = "SELECT " . join(', ', @keys) . " FROM $table WHERE " . join(' AND ', map { "$_ = ?" } @lkeys);
+  my $sql = "SELECT " . join(', ', @keys) . " FROM $table";
+  $sql .= " WHERE " . join(' AND ', map { "$_ = ?" } @lkeys) if @lkeys;
+  $Self->log('debug', $sql, _dbl(map { $limit->{$_} } @lkeys));
   my $data = $Self->dbh->selectrow_hashref($sql, {}, map { $limit->{$_} } @lkeys);
   foreach my $key (@keys) {
     delete $values{$key} if $limit->{$key}; # in the limit, no point setting again
@@ -719,7 +878,7 @@ sub dmaybeupdate {
 sub ddirty {
   my $Self = shift;
   my ($table, $values, $limit) = @_;
-  $values->{jmodseq} = $Self->dirty();
+  $values->{jmodseq} = $Self->dirty($table);
   return $Self->dupdate($table, $values, $limit);
 }
 
@@ -730,22 +889,57 @@ sub dmaybedirty {
   my $filtered = $Self->filter_values($table, $values, $limit);
   return unless %$filtered;
 
-  $filtered->{jmodseq} = $values->{jmodseq} = $Self->dirty();
+  $filtered->{jmodseq} = $values->{jmodseq} = $Self->dirty($table);
   return $Self->dupdate($table, $filtered, $limit);
+}
+
+sub dnuke {
+  my $Self = shift;
+  my ($table, $limit) = @_;
+
+  my $modseq = $Self->dirty($table);
+
+  my @lkeys = sort keys %$limit;
+  my $sql = "UPDATE $table SET active = 0, jmodseq = ? WHERE active = 1";
+  $sql .= " AND " . join(' AND ', map { "$_ = ?" } @lkeys) if @lkeys;
+
+  $Self->log('debug', $sql, _dbl($modseq), _dbl(map { $limit->{$_} } @lkeys));
+
+  $Self->dbh->do($sql, {}, $modseq, map { $limit->{$_} } @lkeys);
 }
 
 sub ddelete {
   my $Self = shift;
   my ($table, $limit) = @_;
 
-  confess("NOT IN TRANSACTION") unless $Self->{t};
-
   my @lkeys = sort keys %$limit;
-  my $sql = "DELETE FROM $table WHERE " . join(' AND ', map { "$_ = ?" } @lkeys);
+  my $sql = "DELETE FROM $table";
+  $sql .= " WHERE " . join(' AND ', map { "$_ = ?" } @lkeys) if @lkeys;
 
   $Self->log('debug', $sql, _dbl(map { $limit->{$_} } @lkeys));
 
   $Self->dbh->do($sql, {}, map { $limit->{$_} } @lkeys);
+}
+
+sub dget {
+  my $Self = shift;
+  my ($table, $limit) = @_;
+
+  my @lkeys = sort keys %$limit;
+  my $sql = "SELECT * FROM $table";
+  $sql .= " WHERE " . join(' AND ', map { "$_ = ?" } @lkeys) if @lkeys;
+
+  $Self->log('debug', $sql, _dbl(map { $limit->{$_} } @lkeys));
+
+  my $data = $Self->dbh->selectall_arrayref($sql, {Slice => {}}, map { $limit->{$_} } @lkeys);
+  return $data;
+}
+
+# selectrow_arrayref?  Nah
+sub dgetone {
+  my $Self = shift;
+  my $res = $Self->dget(@_);
+  return $res->[0];
 }
 
 sub _initdb {
@@ -771,6 +965,8 @@ CREATE TABLE IF NOT EXISTS jmessages (
   msgmessageid TEXT,
   msgdate INTEGER,
   msgsize INTEGER,
+  sortsubject TEXT,
+  jcreated INTEGER,
   jmodseq INTEGER,
   mtime DATE,
   active BOOLEAN
@@ -778,21 +974,23 @@ CREATE TABLE IF NOT EXISTS jmessages (
 EOF
 
   $dbh->do("CREATE INDEX IF NOT EXISTS jthrid ON jmessages (thrid)");
+  $dbh->do("CREATE INDEX IF NOT EXISTS jmsgmessageid ON jmessages (msgmessageid)");
 
   $dbh->do(<<EOF);
 CREATE TABLE IF NOT EXISTS jmailboxes (
   jmailboxid INTEGER PRIMARY KEY,
-  parentid INTEGER,
+  parentId INTEGER,
   role TEXT,
   name TEXT,
-  precedence INTEGER,
-  mustBeOnly BOOLEAN,
-  mayDelete BOOLEAN,
+  sortOrder INTEGER,
+  mustBeOnlyMailbox BOOLEAN,
+  mayReadItems BOOLEAN,
+  mayAddItems BOOLEAN,
+  mayRemoveItems BOOLEAN,
+  mayCreateChild BOOLEAN,
   mayRename BOOLEAN,
-  mayAdd BOOLEAN,
-  mayRemove BOOLEAN,
-  mayChild BOOLEAN,
-  mayRead BOOLEAN,
+  mayDelete BOOLEAN,
+  jcreated INTEGER,
   jmodseq INTEGER,
   jcountsmodseq INTEGER,
   mtime DATE,
@@ -804,6 +1002,7 @@ EOF
 CREATE TABLE IF NOT EXISTS jmessagemap (
   jmailboxid INTEGER,
   msgid TEXT,
+  jcreated INTEGER,
   jmodseq INTEGER,
   mtime DATE,
   active BOOLEAN,
@@ -818,8 +1017,15 @@ CREATE TABLE IF NOT EXISTS account (
   email TEXT,
   displayname TEXT,
   picture TEXT,
-  jdeletedmodseq INTEGER,
-  jhighestmodseq INTEGER,
+  jdeletedmodseq INTEGER NOT NULL DEFAULT 1,
+  jhighestmodseq INTEGER NOT NULL DEFAULT 1,
+  jstateMailbox TEXT NOT NULL DEFAULT 1,
+  jstateThread TEXT NOT NULL DEFAULT 1,
+  jstateMessage TEXT NOT NULL DEFAULT 1,
+  jstateContact TEXT NOT NULL DEFAULT 1,
+  jstateContactGroup TEXT NOT NULL DEFAULT 1,
+  jstateCalendar TEXT NOT NULL DEFAULT 1,
+  jstateCalendarEvent TEXT NOT NULL DEFAULT 1,
   mtime DATE
 );
 EOF
@@ -827,8 +1033,8 @@ EOF
   $dbh->do(<<EOF);
 CREATE TABLE IF NOT EXISTS jrawmessage (
   msgid TEXT PRIMARY KEY,
-  rfc822 TEXT,
   parsed TEXT,
+  hasAttachment INTEGER,
   mtime DATE
 );
 EOF
@@ -840,6 +1046,94 @@ CREATE TABLE IF NOT EXISTS jfiles (
   size INTEGER,
   content TEXT,
   expires DATE,
+  mtime DATE,
+  active BOOLEAN
+);
+EOF
+
+  $dbh->do(<<EOF);
+CREATE TABLE IF NOT EXISTS jcalendars (
+  jcalendarid INTEGER PRIMARY KEY,
+  name TEXT,
+  color TEXT,
+  isVisible BOOLEAN,
+  mayReadFreeBusy BOOLEAN,
+  mayReadItems BOOLEAN,
+  mayAddItems BOOLEAN,
+  mayModifyItems BOOLEAN,
+  mayRemoveItems BOOLEAN,
+  mayDelete BOOLEAN,
+  mayRename BOOLEAN,
+  jcreated INTEGER,
+  jmodseq INTEGER,
+  mtime DATE,
+  active BOOLEAN
+);
+EOF
+
+  $dbh->do(<<EOF);
+CREATE TABLE IF NOT EXISTS jevents (
+  eventuid TEXT PRIMARY KEY,
+  jcalendarid INTEGER,
+  firststart DATE,
+  lastend DATE,
+  payload TEXT,
+  jcreated INTEGER,
+  jmodseq INTEGER,
+  mtime DATE,
+  active BOOLEAN
+);
+EOF
+
+  $dbh->do(<<EOF);
+CREATE TABLE IF NOT EXISTS jaddressbooks (
+  jaddressbookid INTEGER PRIMARY KEY,
+  name TEXT,
+  isVisible BOOLEAN,
+  mayReadItems BOOLEAN,
+  mayAddItems BOOLEAN,
+  mayModifyItems BOOLEAN,
+  mayRemoveItems BOOLEAN,
+  mayDelete BOOLEAN,
+  mayRename BOOLEAN,
+  jcreated INTEGER,
+  jmodseq INTEGER,
+  mtime DATE,
+  active BOOLEAN
+);
+EOF
+
+  $dbh->do(<<EOF);
+CREATE TABLE IF NOT EXISTS jcontactgroups (
+  groupuid TEXT PRIMARY KEY,
+  jaddressbookid INTEGER,
+  name TEXT,
+  jcreated INTEGER,
+  jmodseq INTEGER,
+  mtime DATE,
+  active BOOLEAN
+);
+EOF
+
+  $dbh->do(<<EOF);
+CREATE TABLE IF NOT EXISTS jcontactgroupmap (
+  groupuid TEXT,
+  contactuid TEXT,
+  mtime DATE,
+  PRIMARY KEY (groupuid, contactuid)
+);
+EOF
+
+  $dbh->do("CREATE INDEX IF NOT EXISTS jcontactmap ON jcontactgroupmap (contactuid)");
+
+  $dbh->do(<<EOF);
+CREATE TABLE IF NOT EXISTS jcontacts (
+  contactuid TEXT PRIMARY KEY,
+  jaddressbookid INTEGER,
+  isFlagged BOOLEAN,
+  payload TEXT,
+  jcreated INTEGER,
+  jmodseq INTEGER,
   mtime DATE,
   active BOOLEAN
 );

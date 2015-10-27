@@ -3,10 +3,13 @@
 package JMAP::API;
 
 use JMAP::DB;
-use JSON;
 use strict;
 use warnings;
 use Encode;
+use HTML::GenerateUtil qw(escape_html);
+use JSON::XS;
+
+my $json = JSON::XS->new->utf8->canonical();
 
 sub new {
   my $class = shift;
@@ -15,32 +18,38 @@ sub new {
   return bless {db => $db}, ref($class) || $class;
 }
 
+sub setid {
+  my $Self = shift;
+  my $key = shift;
+  my $val = shift;
+  $Self->{idmap}{"#$key"} = $val;
+}
+
 sub idmap {
   my $Self = shift;
   my $key = shift;
-  if (@_) {
-    $Self->{idmap}{$key} = shift;
-  }
-  return exists $Self->{idmap}{$key} ? $Self->{idmap}{$key} : $key;
+  return unless $key;
+  my $val = exists $Self->{idmap}{$key} ? $Self->{idmap}{$key} : $key;
+  return $val;
 }
 
 sub getAccounts {
   my $Self = shift;
   my $args = shift;
 
-  my $dbh = $Self->{db}->dbh();
-
+  $Self->begin();
   my $user = $Self->{db}->get_user();
+  $Self->commit();
 
   my @list;
   push @list, {
-    id => $Self->{db}->{accountId},
+    id => $Self->{db}->accountid(),
     name => $user->{displayname} || $user->{email},
     isPrimary => $JSON::true,
     isReadOnly => $JSON::false,
     hasMail => $JSON::true,
-    hasContacts => $JSON::false,
-    hasCalendars => $JSON::false,
+    hasContacts => $JSON::true,
+    hasCalendars => $JSON::true,
   };
 
   return ['accounts', {
@@ -49,13 +58,22 @@ sub getAccounts {
   }];
 }
 
+sub refreshSyncedCalendars {
+  my $Self = shift;
+
+  $Self->{db}->sync_calendars();
+
+  # no response
+  return ();
+}
+
 sub getPreferences {
   my $Self = shift;
   my $args = shift;
 
-  my $dbh = $Self->{db}->dbh();
-
+  $Self->begin();
   my $user = $Self->{db}->get_user();
+  $Self->commit();
 
   my @list;
 
@@ -68,9 +86,9 @@ sub getSavedSearches {
   my $Self = shift;
   my $args = shift;
 
-  my $dbh = $Self->{db}->dbh();
-
+  $Self->begin();
   my $user = $Self->{db}->get_user();
+  $Self->commit();
 
   my @list;
 
@@ -84,9 +102,9 @@ sub getPersonalities {
   my $Self = shift;
   my $args = shift;
 
-  my $dbh = $Self->{db}->dbh();
-
+  $Self->begin();
   my $user = $Self->{db}->get_user();
+  $Self->commit();
 
   my @list;
   push @list, {
@@ -96,7 +114,7 @@ sub getPersonalities {
     email => $user->{email},
     name => $user->{displayname} || $user->{email},
     textSignature => "-- \ntext sig",
-    textSignature => "-- \n<b>html sig</b>",
+    htmlSignature => "-- <br><b>html sig</b>",
     replyTo => $user->{email},
     autoBcc => "",
     addBccOnSMTP => $JSON::false,
@@ -121,49 +139,64 @@ sub getPersonalities {
   }];
 }
 
+sub begin {
+  my $Self = shift;
+  $Self->{db}->begin();
+}
+
+sub commit {
+  my $Self = shift;
+  $Self->{db}->commit();
+}
+
+sub _transError {
+  my $Self = shift;
+  if ($Self->{db}->in_transaction()) {
+    $Self->{db}->rollback();
+  }
+  return @_;
+}
+
 sub getMailboxes {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $dbh = $Self->{db}->dbh();
 
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  my $data = $dbh->selectall_arrayref("SELECT jmailboxid, parentid, name, role, precedence, mustBeOnly, mayDelete, mayRename, mayAdd, mayRemove, mayChild, mayRead FROM jmailboxes WHERE active = 1");
+  my $newState = "$user->{jstateMailbox}";
+
+  my $data = $dbh->selectall_arrayref("SELECT * FROM jmailboxes WHERE active = 1", {Slice => {}});
 
   my %ids;
   if ($args->{ids}) {
-    %ids = map { $_ => 1 } @{$args->{ids}};
+    %ids = map { $Self->idmap($_) => 1 } @{$args->{ids}};
   }
   else {
-    %ids = map { $_->[0] => 1 } @$data;
+    %ids = map { $_->{jmailboxid} => 1 } @$data;
   }
 
-  my %byrole = map { $_->[3] => $_->[0] } grep { $_->[3] } @$data;
+  my %byrole = map { $_->{role} => $_->{jmailboxid} } grep { $_->{role} } @$data;
 
   my @list;
 
   my %ONLY_MAILBOXES;
   foreach my $item (@$data) {
-    next unless delete $ids{$item->[0]};
-    $ONLY_MAILBOXES{$item->[0]} = $item->[5];
+    next unless delete $ids{$item->{jmailboxid}};
+    $ONLY_MAILBOXES{$item->{jmailboxid}} = $item->{mustBeOnlyMailbox};
 
     my %rec = (
-      id => "$item->[0]",
-      parentId => ($item->[1] ? "$item->[1]" : undef),
-      name => $item->[2],
-      role => $item->[3],
-      precedence => $item->[4],
-      mustBeOnlyMailbox => $item->[5] ? $JSON::true : $JSON::false,
-      mayDeleteMailbox => $item->[6] ? $JSON::true : $JSON::false,
-      mayRenameMailbox => $item->[7] ? $JSON::true : $JSON::false,
-      mayAddMessages => $item->[8] ? $JSON::true : $JSON::false,
-      mayRemoveMessages => $item->[9] ? $JSON::true : $JSON::false,
-      mayCreateChild => $item->[10] ? $JSON::true : $JSON::false,
-      mayReadMessageList => $item->[11] ? $JSON::true : $JSON::false,
+      id => "$item->{jmailboxid}",
+      parentId => ($item->{parentId} ? "$item->{parentId}" : undef),
+      name => $item->{name},
+      role => $item->{role},
+      sortOrder => $item->{sortOrder},
+      (map { $_ => ($item->{$_} ? $JSON::true : $JSON::false) } qw(mustBeOnlyMailbox mayReadItems mayAddItems mayRemoveItems mayCreateChild mayRename mayDelete)),
     );
 
     foreach my $key (keys %rec) {
@@ -171,16 +204,16 @@ sub getMailboxes {
     }
 
     if (_prop_wanted($args, 'totalMessages')) {
-      ($rec{totalMessages}) = $dbh->selectrow_array("SELECT COUNT(DISTINCT msgid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = ? AND jmessages.active = 1 AND jmessagemap.active = 1", {}, $item->[0]);
+      ($rec{totalMessages}) = $dbh->selectrow_array("SELECT COUNT(DISTINCT msgid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = ? AND jmessages.active = 1 AND jmessagemap.active = 1", {}, $item->{jmailboxid});
       $rec{totalMessages} += 0;
     }
     if (_prop_wanted($args, 'unreadMessages')) {
-      ($rec{unreadMessages}) = $dbh->selectrow_array("SELECT COUNT(DISTINCT msgid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = ? AND jmessages.isUnread = 1 AND jmessages.active = 1 AND jmessagemap.active = 1", {}, $item->[0]);
+      ($rec{unreadMessages}) = $dbh->selectrow_array("SELECT COUNT(DISTINCT msgid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = ? AND jmessages.isUnread = 1 AND jmessages.active = 1 AND jmessagemap.active = 1", {}, $item->{jmailboxid});
       $rec{unreadMessages} += 0;
     }
 
     if (_prop_wanted($args, 'totalThreads')) {
-      ($rec{totalThreads}) = $dbh->selectrow_array("SELECT COUNT(DISTINCT thrid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = ? AND jmessages.active = 1 AND jmessagemap.active = 1", {}, $item->[0]);
+      ($rec{totalThreads}) = $dbh->selectrow_array("SELECT COUNT(DISTINCT thrid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = ? AND jmessages.active = 1 AND jmessagemap.active = 1", {}, $item->{jmailboxid});
       $rec{totalThreads} += 0;
     }
 
@@ -188,13 +221,14 @@ sub getMailboxes {
     # so long as they aren't in an ONLY_MAILBOXES folder
     if (_prop_wanted($args, 'unreadThreads')) {
       my $folderlimit = '';
-      if ($ONLY_MAILBOXES{$item->[0]}) {
-        $folderlimit = "AND jmessagemap.jmailboxid = $item->[0]";
+      if ($ONLY_MAILBOXES{$item->{jmailboxid}}) {
+        $folderlimit = "AND jmessagemap.jmailboxid = " . $dbh->quote($item->{jmailboxid});
       } else {
         my @ids = grep { $ONLY_MAILBOXES{$_} } sort keys %ONLY_MAILBOXES;
-        $folderlimit = "AND jmessagemap.jmailboxid NOT IN (" . join(',', @ids) . ")" if @ids;
+        $folderlimit = "AND jmessagemap.jmailboxid NOT IN (" . join(',', map { $dbh->quote($_) } @ids) . ")" if @ids;
       }
-      ($rec{unreadThreads}) = $dbh->selectrow_array("SELECT COUNT(DISTINCT thrid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = $item->[0] AND jmessages.active = 1 AND jmessagemap.active = 1 AND thrid IN (SELECT thrid FROM jmessages JOIN jmessagemap USING (msgid) WHERE isUnread = 1 AND jmessages.active = 1 AND jmessagemap.active = 1 $folderlimit)");
+      my $sql ="SELECT COUNT(DISTINCT thrid) FROM jmessages JOIN jmessagemap USING (msgid) WHERE jmailboxid = ? AND jmessages.active = 1 AND jmessagemap.active = 1 AND thrid IN (SELECT thrid FROM jmessages JOIN jmessagemap USING (msgid) WHERE isUnread = 1 AND jmessages.active = 1 AND jmessagemap.active = 1 $folderlimit)";
+      ($rec{unreadThreads}) = $dbh->selectrow_array($sql, {}, $item->{jmailboxid});
       $rec{unreadThreads} += 0;
     }
 
@@ -202,10 +236,12 @@ sub getMailboxes {
   }
   my %missingids = %ids;
 
+  $Self->commit();
+
   return ['mailboxes', {
     list => \@list,
     accountId => $accountid,
-    state => "$user->{jhighestmodseq}",
+    state => $newState,
     notFound => (%missingids ? [map { "$_" } keys %missingids] : undef),
   }];
 }
@@ -214,8 +250,10 @@ sub getIdentities {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
+  $Self->commit();
 
   return ['identities', {
     accountId => $accountid,
@@ -233,54 +271,49 @@ sub getIdentities {
 sub getMailboxUpdates {
   my $Self = shift;
   my $args = shift;
-  my $dbh = $Self->{db}->dbh();
 
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
+  my $newState = "$user->{jstateMailbox}";
+
   my $sinceState = $args->{sinceState};
-  return ['error', {type => 'invalidArguments'}]
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not $args->{sinceState};
-  return ['error', {type => 'cannotCalculateChanges'}]
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
     if ($user->{jdeletedmodseq} and $sinceState <= $user->{jdeletedmodseq});
 
-  my $data = $dbh->selectall_arrayref("SELECT jmailboxid, jmodseq, jcountsmodseq, active FROM jmailboxes ORDER BY jmailboxid");
+  my $data = $dbh->selectall_arrayref("SELECT * FROM jmailboxes WHERE jmodseq > ?1 OR jcountsmodseq > ?1", {Slice => {}}, $sinceState);
 
   my @changed;
   my @removed;
   my $onlyCounts = 1;
   foreach my $item (@$data) {
-    if ($item->[1] > $sinceState) {
-      if ($item->[3]) {
-        push @changed, $item->[0];
-        $onlyCounts = 0;
-      }
-      else {
-        push @removed, $item->[0];
-      }
+    if ($item->{active}) {
+      push @changed, $item->{jmailboxid};
+      $onlyCounts = 0 if $item->{jmodseq} > $sinceState;
     }
-    elsif (($item->[2] || 0) > $sinceState) {
-      if ($item->[3]) {
-        push @changed, $item->[0];
-      }
-      else {
-        push @removed, $item->[0];
-      }
+    else {
+      push @removed, $item->{jmailboxid};
     }
   }
+
+  $Self->commit();
 
   my @res = (['mailboxUpdates', {
     accountId => $accountid,
     oldState => "$sinceState",
-    newState => "$user->{jhighestmodseq}",
+    newState => $newState,
     changed => [map { "$_" } @changed],
     removed => [map { "$_" } @removed],
     onlyCountsChanged => $onlyCounts ? JSON::true : JSON::false,
   }]);
 
-  if (@changed and $args->{fetchMailboxes}) {
+  if (@changed and $args->{fetchRecords}) {
     my %items = (
       accountid => $accountid,
       ids => \@changed,
@@ -288,8 +321,8 @@ sub getMailboxUpdates {
     if ($onlyCounts) {
       $items{properties} = [qw(totalMessages unreadMessages totalThreads unreadThreads)];
     }
-    elsif ($args->{fetchMailboxProperties}) {
-      $items{properties} = $args->{fetchMailboxProperties};
+    elsif ($args->{fetchRecordProperties}) {
+      $items{properties} = $args->{fetchRecordProperties};
     }
     push @res, $Self->getMailboxes(\%items);
   }
@@ -299,19 +332,60 @@ sub getMailboxUpdates {
 
 sub setMailboxes {
   my $Self = shift;
-  return ['error', {type => 'notImplemented'}];
+  my $args = shift;
+
+  $Self->begin();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  $Self->commit();
+
+  my $create = $args->{create} || {};
+  my $update = $args->{update} || {};
+  my $destroy = $args->{destroy} || [];
+
+  $Self->{db}->begin_superlock();
+
+  my ($created, $notCreated) = $Self->{db}->create_mailboxes($create);
+  $Self->setid($_, $created->{$_}{id}) for keys %$created;
+  my ($updated, $notUpdated) = $Self->{db}->update_mailboxes($update, sub { $Self->idmap(shift) });
+  my ($destroyed, $notDestroyed) = $Self->{db}->destroy_mailboxes($destroy);
+
+  $Self->{db}->sync_imap();
+
+  $Self->{db}->end_superlock();
+
+  my @res;
+  push @res, ['mailboxesSet', {
+    accountId => $accountid,
+    oldState => undef, # proxy can't guarantee the old state
+    newState => undef, # or give a new state
+    created => $created,
+    notCreated => $notCreated,
+    updated => $updated,
+    notUpdated => $notUpdated,
+    destroyed => $destroyed,
+    notDestroyed => $notDestroyed,
+  }];
+
+  return @res;
 }
 
 sub _build_sort {
   my $Self = shift;
-  my $sortargs = shift;
-  return 'internaldate desc' unless $sortargs;
+  my $sortargs = shift || [];
   my %fieldmap = (
     id => 'msgid',
-    date => 'internaldate',
+    date => 'msgdate',
     size => 'msgsize',
     isflagged => 'isFlagged',
     isunread => 'isUnread',
+    subject => 'sortsubject',
+    from => 'msgfrom',
+    to => 'msgto',
   );
   my @items;
   $sortargs = [$sortargs] unless ref $sortargs;
@@ -322,8 +396,7 @@ sub _build_sort {
     die unless $fieldmap{$field};
     push @items, "$fieldmap{$field} $dir";
   }
-  # XXX - sort by the from/subject fields
-  # XXX - threads?
+  push @items, "msgid desc"; # guarantee stable
   return join(', ', @items);
 }
 
@@ -331,8 +404,18 @@ sub _load_mailbox {
   my $Self = shift;
   my $id = shift;
 
+  $Self->begin();
   my $data = $Self->{db}->dbh->selectall_arrayref("SELECT msgid,jmodseq,active FROM jmessagemap WHERE jmailboxid = ?", {}, $id);
+  $Self->commit();
   return { map { $_->[0] => $_ } @$data };
+}
+
+sub _load_hasatt {
+  my $Self = shift;
+  $Self->begin();
+  my $data = $Self->{db}->dbh->selectcol_arrayref("SELECT msgid FROM jrawmessage WHERE hasAttachment = 1");
+  $Self->commit();
+  return { map { $_ => 1 } @$data };
 }
 
 sub _match {
@@ -340,19 +423,110 @@ sub _match {
   my ($item, $condition, $storage) = @_;
   return $Self->_match_operator($item, $condition, $storage) if $condition->{operator};
 
-  # XXX - condition handling code
   if ($condition->{inMailboxes}) {
-    my $match = 0;
-    foreach my $id (@{$condition->{inMailboxes}}) {
+    my $inall = 1;
+    foreach my $id (map { $Self->idmap($_) } @{$condition->{inMailboxes}}) {
       $storage->{mailbox}{$id} ||= $Self->_load_mailbox($id);
-      next unless $storage->{mailbox}{$id}{$item->[0]}[2]; #active
-      $match = 1;
+      next if $storage->{mailbox}{$id}{$item->{msgid}}[2]; #active
+      $inall = 0;
     }
-    return 0 unless $match;
+    return 0 unless $inall;
   }
 
-  if ($condition->{isUnseen}) {
+  if ($condition->{notInMailboxes}) {
+    my $inany = 0;
+    foreach my $id (map { $Self->idmap($_) } @{$condition->{notInMailboxes}}) {
+      $storage->{mailbox}{$id} ||= $Self->_load_mailbox($id);
+      next unless $storage->{mailbox}{$id}{$item->{msgid}}[2]; #active
+      $inany = 1;
+    }
+    return 0 if $inany;
+  }
+
+  if ($condition->{before}) {
+    my $time = str2time($condition->{before})->epoch();
+    return 0 unless $time < $item->{internaldate};
+  }
+
+  if ($condition->{after}) {
+    my $time = str2time($condition->{before})->epoch();
+    return 0 unless $time >= $item->{internaldate};
+  }
+
+  if ($condition->{minSize}) {
+    return 0 unless $item->{msgsize} >= $condition->{minSize};
+  }
+
+  if ($condition->{maxSize}) {
+    return 0 unless $item->{msgsize} < $condition->{maxSize};
+  }
+
+  if ($condition->{isFlagged}) {
     # XXX - threaded versions?
+    return 0 unless $item->{isFlagged};
+  }
+
+  if ($condition->{isUnread}) {
+    # XXX - threaded versions?
+    return 0 unless $item->{isUnread};
+  }
+
+  if ($condition->{isAnswered}) {
+    # XXX - threaded versions?
+    return 0 unless $item->{isAnswered};
+  }
+
+  if ($condition->{isDraft}) {
+    # XXX - threaded versions?
+    return 0 unless $item->{isDraft};
+  }
+
+  if ($condition->{hasAttachment}) {
+    $storage->{hasatt} ||= $Self->_load_hasatt();
+    return 0 unless $storage->{hasatt}{$item->{msgid}};
+    # XXX - hasAttachment
+  }
+
+  if ($condition->{text}) {
+    $storage->{textsearch}{$condition->{text}} ||= $Self->{db}->imap_search('text', $condition->{text});
+    return 0 unless $storage->{textsearch}{$condition->{text}}{$item->{msgid}};
+  }
+
+  if ($condition->{from}) {
+    $storage->{fromsearch}{$condition->{from}} ||= $Self->{db}->imap_search('from', $condition->{from});
+    return 0 unless $storage->{fromsearch}{$condition->{from}}{$item->{msgid}};
+  }
+
+  if ($condition->{to}) {
+    $storage->{tosearch}{$condition->{to}} ||= $Self->{db}->imap_search('to', $condition->{to});
+    return 0 unless $storage->{tosearch}{$condition->{to}}{$item->{msgid}};
+  }
+
+  if ($condition->{cc}) {
+    $storage->{ccsearch}{$condition->{cc}} ||= $Self->{db}->imap_search('cc', $condition->{cc});
+    return 0 unless $storage->{ccsearch}{$condition->{cc}}{$item->{msgid}};
+  }
+
+  if ($condition->{bcc}) {
+    $storage->{bccsearch}{$condition->{bcc}} ||= $Self->{db}->imap_search('bcc', $condition->{bcc});
+    return 0 unless $storage->{bccsearch}{$condition->{bcc}}{$item->{msgid}};
+  }
+
+  if ($condition->{subject}) {
+    $storage->{subjectsearch}{$condition->{subject}} ||= $Self->{db}->imap_search('subject', $condition->{subject});
+    return 0 unless $storage->{subjectsearch}{$condition->{subject}}{$item->{msgid}};
+  }
+
+  if ($condition->{body}) {
+    $storage->{bodysearch}{$condition->{body}} ||= $Self->{db}->imap_search('body', $condition->{body});
+    return 0 unless $storage->{bodysearch}{$condition->{body}}{$item->{msgid}};
+  }
+
+  if ($condition->{header}) {
+    my $cond = $condition->{header};
+    $cond->[1] = '' if @$cond == 1;
+    $storage->{headersearch}{"@$cond"} ||= $Self->{db}->imap_search('header', @$cond);
+    return 0 unless $storage->{headersearch}{"@$cond"}{$item->{msgid}};
   }
 
   return 1;
@@ -396,9 +570,9 @@ sub _collapse {
   my @res;
   my %seen;
   foreach my $item (@$data) {
-    next if $seen{$item->[1]};
+    next if $seen{$item->{thrid}};
     push @res, $item;
-    $seen{$item->[1]} = 1;
+    $seen{$item->{thrid}} = 1;
   }
   return \@res;
 }
@@ -407,27 +581,31 @@ sub getMessageList {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $dbh = $Self->{db}->dbh();
 
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  return ['error', {type => 'invalidArguments'}]
+  my $newState = "$user->{jstateMailbox}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if (exists $args->{position} and exists $args->{anchor});
-  return ['error', {type => 'invalidArguments'}]
-    if (not exists $args->{position} and not exists $args->{anchor});
-  return ['error', {type => 'invalidArguments'}]
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if (exists $args->{anchor} and not exists $args->{anchorOffset});
-  return ['error', {type => 'invalidArguments'}]
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if (not exists $args->{anchor} and exists $args->{anchorOffset});
 
   my $start = $args->{position} || 0;
-  return ['error', {type => 'invalidArguments'}] if $start < 0;
+  return $Self->_transError(['error', {type => 'invalidArguments'}]) if $start < 0;
 
   my $sort = $Self->_build_sort($args->{sort});
-  my $data = $dbh->selectall_arrayref("SELECT msgid,thrid FROM jmessages WHERE active = 1 ORDER BY $sort");
+  my $data = $dbh->selectall_arrayref("SELECT * FROM jmessages WHERE active = 1 ORDER BY $sort", {Slice => {}});
+
+  # commit before applying the filter, because it might call out for searches
+  $Self->commit();
 
   $data = $Self->_filter($data, $args->{filter}, {}) if $args->{filter};
   $data = $Self->_collapse($data) if $args->{collapseThreads};
@@ -440,15 +618,16 @@ sub getMessageList {
       $start = 0 if $start < 0;
       goto gotit;
     }
-    return ['error', {type => 'anchorNotFound'}];
+    return $Self->_transError(['error', {type => 'anchorNotFound'}]);
   }
 
 gotit:
+
   my $end = $args->{limit} ? $start + $args->{limit} - 1 : $#$data;
   $end = $#$data if $end > $#$data;
 
-  my @result = map { $data->[$_][0] } $start..$end;
-  my @thrid = map { $data->[$_][1] } $start..$end;
+  my @result = map { $data->[$_]{msgid} } $start..$end;
+  my @thrid = map { $data->[$_]{thrid} } $start..$end;
 
   my @res;
   push @res, ['messageList', {
@@ -456,7 +635,7 @@ gotit:
     filter => $args->{filter},
     sort => $args->{sort},
     collapseThreads => $args->{collapseThreads},
-    state => "$user->{jhighestmodseq}",
+    state => $newState,
     canCalculateUpdates => $JSON::true,
     position => $start,
     total => scalar(@$data),
@@ -485,26 +664,32 @@ sub getMessageListUpdates {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $dbh = $Self->{db}->dbh();
 
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  return ['error', {type => 'invalidArguments'}]
+  my $newState = "$user->{jstateMailbox}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not $args->{sinceState};
-  return ['error', {type => 'cannotCalculateChanges'}]
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
     if ($user->{jdeletedmodseq} and $args->{sinceState} <= $user->{jdeletedmodseq});
 
   my $start = $args->{position} || 0;
-  return ['error', {type => 'invalidArguments'}] if $start < 0;
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if $start < 0;
 
   my $sort = $Self->_build_sort($args->{sort});
-  my $data = $dbh->selectall_arrayref("SELECT msgid,thrid,jmodseq,active FROM jmessages ORDER BY $sort");
+  my $data = $dbh->selectall_arrayref("SELECT * FROM jmessages ORDER BY $sort", {Slice => {}});
+
+  $Self->commit();
 
   # now we have the same sorted data set.  What we DON'T have is knowing that a message used to be in the filter,
-  # but no longer is (aka isUnseen).  There's no good way to do this :(  So we have to assume that every message
+  # but no longer is (aka isUnread).  There's no good way to do this :(  So we have to assume that every message
   # which is changed and NOT in the dataset used to be...
 
   # we also have to assume that it MIGHT have been the exemplar...
@@ -524,53 +709,52 @@ sub getMessageListUpdates {
     # non-deleted, unchanged message)
     my %finished;
     foreach my $item (@$data) {
-      my ($msgid, $thrid, $jmodseq, $active) = @$item;
-
       # we don't have to tell anything about finished threads, not even check them for membership in the search
-      next if $finished{$thrid};
+      next if $finished{$item->{thrid}};
 
       # deleted is the same as not in filter for our purposes
-      my $isin = $active ? ($args->{filter} ? $Self->_match($item, $args->{filter}, $storage) : 1) : 0;
+      my $isin = $item->{active} ? ($args->{filter} ? $Self->_match($item, $args->{filter}, $storage) : 1) : 0;
 
       # only exemplars count for the total - we need to know total even if not telling any more
-      if ($isin and not $exemplar{$thrid}) {
+      if ($isin and not $exemplar{$item->{thrid}}) {
         $total++;
-        $exemplar{$thrid} = $msgid;
+        $exemplar{$item->{thrid}} = $item->{msgid};
       }
       next unless $tell;
 
       # jmodseq greater than sinceState is a change
-      my $changed = ($jmodseq > $args->{sinceState});
+      my $changed = ($item->{jmodseq} > $args->{sinceState});
+      my $isnew = ($item->{jcreated} > $args->{sinceState});
 
       if ($changed) {
         # if it's in AND it's the exemplar, it's been added
-        if ($isin and $exemplar{$thrid} eq $msgid) {
-          push @added, {messageId => "$msgid", threadId => "$thrid", index => $total-1};
-          push @removed, {messageId => "$msgid", threadId => "$thrid"};
+        if ($isin and $exemplar{$item->{thrid}} eq $item->{msgid}) {
+          push @added, {messageId => "$item->{msgid}", threadId => "$item->{thrid}", index => $total-1};
+          push @removed, {messageId => "$item->{msgid}", threadId => "$item->{thrid}"};
           $changes++;
         }
         # otherwise it's removed
         else {
-          push @removed, {messageId => "$msgid", threadId => "$thrid"};
+          push @removed, {messageId => "$item->{msgid}", threadId => "$item->{thrid}"};
           $changes++;
         }
       }
       # unchanged and isin, final candidate for old exemplar!
       elsif ($isin) {
         # remove it unless it's also the current exemplar
-        if ($exemplar{$thrid} ne $msgid) {
-          push @removed, {messageId => "$msgid", threadId => "$thrid"};
+        if ($exemplar{$item->{thrid}} ne $item->{msgid}) {
+          push @removed, {messageId => "$item->{msgid}", threadId => "$item->{thrid}"};
           $changes++;
         }
         # and we're done
-        $finished{$thrid} = 1;
+        $finished{$item->{thrid}} = 1;
       }
 
       if ($args->{maxChanges} and $changes > $args->{maxChanges}) {
-        return ['error', {type => 'tooManyChanges'}];
+        return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}]);
       }
 
-      if ($args->{upToMessageId} and $args->{upToMessageId} eq $msgid) {
+      if ($args->{upToMessageId} and $args->{upToMessageId} eq $item->{msgid}) {
         # stop mentioning changes
         $tell = 0;
       }
@@ -580,34 +764,34 @@ sub getMessageListUpdates {
   # non-collapsed case
   else {
     foreach my $item (@$data) {
-      my ($msgid, $thrid, $jmodseq, $active) = @$item;
       # deleted is the same as not in filter for our purposes
-      my $isin = $active ? ($args->{filter} ? $Self->_match($item, $args->{filter}, $storage) : 1) : 0;
+      my $isin = $item->{active} ? ($args->{filter} ? $Self->_match($item, $args->{filter}, $storage) : 1) : 0;
 
       # all active messages count for the total
       $total++ if $isin;
       next unless $tell;
 
       # jmodseq greater than sinceState is a change
-      my $changed = ($jmodseq > $args->{sinceState});
+      my $changed = ($item->{jmodseq} > $args->{sinceState});
+      my $isnew = ($item->{jcreated} > $args->{sinceState});
 
       if ($changed) {
         if ($isin) {
-          push @added, {messageId => "$msgid", threadId => "$thrid", index => $total-1};
-          push @removed, {messageId => "$msgid", threadId => "$thrid"};
+          push @added, {messageId => "$item->{msgid}", threadId => "$item->{thrid}", index => $total-1};
+          push @removed, {messageId => "$item->{msgid}", threadId => "$item->{thrid}"};
           $changes++;
         }
         else {
-          push @removed, {messageId => "$msgid", threadId => "$thrid"};
+          push @removed, {messageId => "$item->{msgid}", threadId => "$item->{thrid}"};
           $changes++;
         }
       }
 
       if ($args->{maxChanges} and $changes > $args->{maxChanges}) {
-        return ['error', {type => 'tooManyChanges'}];
+        return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}]);
       }
 
-      if ($args->{upToMessageId} and $args->{upToMessageId} eq $msgid) {
+      if ($args->{upToMessageId} and $args->{upToMessageId} eq $item->{msgid}) {
         # stop mentioning changes
         $tell = 0;
       }
@@ -621,7 +805,7 @@ sub getMessageListUpdates {
     sort => $args->{sort},
     collapseThreads => $args->{collapseThreads},
     oldState => "$args->{sinceState}",
-    newState => "$user->{jhighestmodseq}",
+    newState => $newState,
     removed => \@removed,
     added => \@added,
     total => $total,
@@ -630,18 +814,74 @@ sub getMessageListUpdates {
   return @res;
 }
 
+sub _extract_terms {
+  my $filter = shift;
+  return () unless $filter;
+  my @list;
+  push @list, _extract_terms($filter->{conditions});
+  push @list, $filter->{body} if $filter->{body};
+  push @list, $filter->{text} if $filter->{text};
+  push @list, $filter->{subject} if $filter->{subject};
+  return @list;
+}
+
+sub getSearchSnippets {
+  my $Self = shift;
+  my $args = shift;
+
+  my $messages = $Self->getMessages({
+    accountId => $args->{accountId},
+    ids => $args->{messageIds},
+    properties => ['subject', 'textBody', 'preview'],
+  });
+
+  return $messages unless $messages->[0] eq 'messages';
+  $messages->[0] = 'searchSnippets';
+  delete $messages->[1]{state};
+  $messages->[1]{filter} = $args->{filter};
+  $messages->[1]{collapseThreads} = $args->{collapseThreads}, # work around client bug
+
+  my @terms = _extract_terms($args->{filter});
+  my $str = join("|", @terms);
+  my $tag = 'mark';
+  foreach my $item (@{$messages->[1]{list}}) {
+    $item->{messageId} = delete $item->{id};
+    my $text = delete $item->{textBody};
+    $item->{subject} = escape_html($item->{subject});
+    $item->{preview} = escape_html($item->{preview});
+    next unless @terms;
+    $item->{subject} =~ s{\b($str)\b}{<$tag>$1</$tag>}gsi;
+    if ($text =~ m{(.{0,20}\b(?:$str)\b.*)}gsi) {
+      $item->{preview} = substr($1, 0, 200);
+      $item->{preview} =~ s{^\s+}{}gs;
+      $item->{preview} =~ s{\s+$}{}gs;
+      $item->{preview} =~ s{[\r\n]+}{ -- }gs;
+      $item->{preview} =~ s{\s+}{ }gs;
+      $item->{preview} = escape_html($item->{preview});
+      $item->{preview} =~ s{\b($str)\b}{<$tag>$1</$tag>}gsi;
+    }
+    $item->{body} = $item->{preview}; # work around client bug
+  }
+
+  return $messages;
+}
+
 sub getMessages {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $dbh = $Self->{db}->dbh();
 
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  return ['error', {type => 'invalidArguments'}] unless $args->{ids};
+  my $newState = "$user->{jstateMessage}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    unless $args->{ids};
   #properties: String[] A list of properties to fetch for each message.
 
   # XXX - lots to do about properties here
@@ -654,7 +894,7 @@ sub getMessages {
   }
   $need_content = 1 if ($args->{properties} and grep { m/^headers\./ } @{$args->{properties}});
   my %msgidmap;
-  foreach my $msgid (@{$args->{ids}}) {
+  foreach my $msgid (map { $Self->idmap($_) } @{$args->{ids}}) {
     next if $seenids{$msgid};
     $seenids{$msgid} = 1;
     my $data = $dbh->selectrow_hashref("SELECT * FROM jmessages WHERE msgid = ?", {}, $msgid);
@@ -715,12 +955,14 @@ sub getMessages {
       $item->{size} = $data->{msgsize};
     }
 
-    if (_prop_wanted($args, 'rawUrl')) {
-      $item->{rawUrl} = "https://proxy.jmap.io/raw/$accountid/$msgid";
+    if (_prop_wanted($args, 'blobId')) {
+      $item->{blobId} = "m-$msgid";
     }
 
     push @list, $item;
   }
+
+  $Self->commit();
 
   # need to load messages from the server
   if ($need_content) {
@@ -753,7 +995,7 @@ sub getMessages {
         my %wanted;
         foreach my $prop (@{$args->{properties}}) {
           next unless $prop =~ m/^headers\.(.*)/;
-	  $item->{headers} ||= {}; # avoid zero matched headers bug
+          $item->{headers} ||= {}; # avoid zero matched headers bug
           $wanted{lc $1} = 1;
         }
         foreach my $key (keys %{$data->{headers}}) {
@@ -773,7 +1015,7 @@ sub getMessages {
   return ['messages', {
     list => \@list,
     accountId => $accountid,
-    state => "$user->{jhighestmodseq}",
+    state => $newState,
     notFound => (%missingids ? [keys %missingids] : undef),
   }];
 }
@@ -784,19 +1026,36 @@ sub getRawMessage {
   my $selector = shift;
 
   my $msgid = $selector;
+  return () unless $msgid =~ s/^([mf])-//;
+  my $source = $1;
   my $part;
   my $filename;
-  if ($msgid =~ s{/([^/]+)/?(.*)}{}) {
-    $part = $1;
-    $filename = $2;
+  if ($msgid =~ s{/(.*)}{}) {
+    $filename = $1;
+  }
+  if ($msgid =~ s{-(.*)}{}) {
+   $part = $1;
   }
 
-  my $dbh = $Self->{db}->dbh();
-  my ($content) = $dbh->selectrow_array("SELECT rfc822 FROM jrawmessage WHERE msgid = ?", {}, $msgid);
-  return unless $content;
+  my ($type, $data);
+  if ($source eq 'f') {
+    ($type, $data) = $Self->get_file($msgid);
+  }
+  else {
+    ($type, $data) = $Self->{db}->get_raw_message($msgid, $part);
+  }
 
-  my ($type, $data) = $Self->{db}->get_raw_message($content, $part);
   return ($type, $data, $filename);
+}
+
+sub get_file {
+  my $Self = shift;
+  my $jfileid = shift;
+
+  my $dbh = $Self->{db}->dbh();
+  my ($type, $content) = $dbh->selectrow_array("SELECT type, content FROM jfiles WHERE jfileid = ?", {}, $jfileid);
+  return unless $content;
+  return ($type, $content);
 }
 
 # or this
@@ -804,7 +1063,7 @@ sub uploadFile {
   my $Self = shift;
   my ($type, $content) = @_; # XXX filehandle?
 
-  return $Self->upload_file($type, $content);
+  return $Self->{db}->put_file($type, $content);
 }
 
 sub downloadFile {
@@ -820,16 +1079,19 @@ sub getMessageUpdates {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $dbh = $Self->{db}->dbh();
 
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  return ['error', {type => 'invalidArguments'}]
+  my $newState = "$user->{jstateMessage}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not $args->{sinceState};
-  return ['error', {type => 'cannotCalculateChanges'}]
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
     if ($user->{jdeletedmodseq} and $args->{sinceState} <= $user->{jdeletedmodseq});
 
   my $sql = "SELECT msgid,active FROM jmessages WHERE jmodseq > ?";
@@ -837,7 +1099,7 @@ sub getMessageUpdates {
   my $data = $dbh->selectall_arrayref($sql, {}, $args->{sinceState});
 
   if ($args->{maxChanges} and @$data > $args->{maxChanges}) {
-    return ['error', {type => 'tooManyChanges'}];
+    return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}]);
   }
 
   my @changed;
@@ -852,20 +1114,22 @@ sub getMessageUpdates {
     }
   }
 
+  $Self->commit();
+
   my @res;
   push @res, ['messageUpdates', {
     accountId => $accountid,
     oldState => "$args->{sinceState}",
-    newState => "$user->{jhighestmodseq}",
+    newState => $newState,
     changed => [map { "$_" } @changed],
     removed => [map { "$_" } @removed],
   }];
 
-  if ($args->{fetchMessages}) {
+  if ($args->{fetchRecords}) {
     push @res, $Self->getMessages({
       accountid => $accountid,
       ids => \@changed,
-      properties => $args->{fetchMessageProperties},
+      properties => $args->{fetchRecordProperties},
     }) if @changed;
   }
 
@@ -876,40 +1140,46 @@ sub setMessages {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
+
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  $Self->commit();
 
   my $create = $args->{create} || {};
   my $update = $args->{update} || {};
-  my $delete = $args->{delete} || [];
+  my $destroy = $args->{destroy} || [];
 
-  # XXX - idmap support
+  $Self->{db}->begin_superlock();
+
   my ($created, $notCreated) = $Self->{db}->create_messages($create);
-  my ($updated, $notUpdated) = $Self->{db}->update_messages($update);
-  my ($deleted, $notDeleted) = $Self->{db}->delete_messages($delete);
+  $Self->setid($_, $created->{$_}{id}) for keys %$created;
+  my ($updated, $notUpdated) = $Self->{db}->update_messages($update, sub { $Self->idmap(shift) });
+  my ($destroyed, $notDestroyed) = $Self->{db}->destroy_messages($destroy);
 
-  $Self->{db}->sync();
+  $Self->{db}->sync_imap();
+
+  $Self->{db}->end_superlock();
 
   foreach my $cid (sort keys %$created) {
     my $msgid = $created->{$cid}{id};
-    $created->{$cid}{rawUrl} = "https://proxy.jmap.io/raw/$accountid/$msgid";
+    $created->{$cid}{blobId} = "m-$msgid";
   }
 
   my @res;
   push @res, ['messagesSet', {
     accountId => $accountid,
     oldState => undef, # proxy can't guarantee the old state
-    # this is actually the state BEFORE the changes, so the client will get a spurious duplicate of the change, but there's
-    # no nice way to avoid that...
-    newState => "$user->{jhighestmodseq}",
+    newState => undef, # or give a new state
     created => $created,
     notCreated => $notCreated,
     updated => $updated,
     notUpdated => $notUpdated,
-    deleted => $deleted,
-    notDeleted => $notDeleted,
+    destroyed => $destroyed,
+    notDestroyed => $notDestroyed,
   }];
 
   return @res;
@@ -919,22 +1189,27 @@ sub importMessage {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
+
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  return ['error', {type => 'invalidArguments'}]
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not $args->{file};
-  return ['error', {type => 'invalidArguments'}]
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not $args->{mailboxIds};
 
   my ($type, $message) = $Self->get_file($args->{file});
-  return ['error', {type => 'notFound'}]
+  return $Self->_transError(['error', {type => 'notFound'}])
     if (not $type or $type ne 'message/rfc822');
 
+  $Self->commit();
+
   # import to a normal mailbox (or boxes)
-  my ($msgid, $thrid) = $Self->import_message($message, $args->{mailboxIds},
+  my @ids = map { $Self->idmap($_) } @{$args->{mailboxIds}};
+  my ($msgid, $thrid) = $Self->import_message($message, \@ids,
     isUnread => $args->{isUnread},
     isFlagged => $args->{isFlagged},
     isAnswered => $args->{isAnswered},
@@ -952,25 +1227,30 @@ sub importMessage {
 
 sub copyMessages {
   my $Self = shift;
-  return ['error', {type => 'notImplemented'}];
+  return $Self->_transError(['error', {type => 'notImplemented'}]);
 }
 
 sub reportMessages {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
+
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  return ['error', {type => 'invalidArguments'}]
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not $args->{messageIds};
 
-  return ['error', {type => 'invalidArguments'}]
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not exists $args->{asSpam};
 
-  my ($reported, $notfound) = $Self->report_messages($args->{messageIds}, $args->{asSpam});
+  $Self->commit();
+
+  my @ids = map { $Self->idmap($_) } @{$args->{messageIds}};
+  my ($reported, $notfound) = $Self->report_messages(\@ids, $args->{asSpam});
 
   my @res;
   push @res, ['messagesReported', {
@@ -987,12 +1267,15 @@ sub getThreads {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $dbh = $Self->{db}->dbh();
 
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateThread}";
 
   # XXX - error if no IDs
 
@@ -1000,11 +1283,11 @@ sub getThreads {
   my %seenids;
   my %missingids;
   my @allmsgs;
-  foreach my $thrid (@{$args->{ids}}) {
+  foreach my $thrid (map { $Self->idmap($_) } @{$args->{ids}}) {
     next if $seenids{$thrid};
     $seenids{$thrid} = 1;
-    my $data = $dbh->selectall_arrayref("SELECT msgid,isDraft,msgmessageid,msginreplyto FROM jmessages WHERE thrid = ? ORDER BY internaldate", {}, $thrid);
-    unless ($data) {
+    my $data = $dbh->selectall_arrayref("SELECT * FROM jmessages WHERE thrid = ? AND active = 1 ORDER BY internaldate", {Slice => {}}, $thrid);
+    unless (@$data) {
       $missingids{$thrid} = 1;
       next;
     }
@@ -1012,23 +1295,25 @@ sub getThreads {
     my @msgs;
     my %seenmsgs;
     foreach my $item (@$data) {
-      next unless $item->[1];
-      push @{$drafts{$item->[3]}}, $item->[0];
+      next unless $item->{isDraft};
+      next unless $item->{msginreplyto};  # push the rest of the drafts to the end
+      push @{$drafts{$item->{msginreplyto}}}, $item->{msgid};
     }
     foreach my $item (@$data) {
-      next if $item->[1];
-      push @msgs, $item->[0];
-      $seenmsgs{$item->[0]} = 1;
-      if (my $draftmsgs = $drafts{$item->[2]}) {
+      next if $item->{isDraft};
+      push @msgs, $item->{msgid};
+      $seenmsgs{$item->{msgid}} = 1;
+      next unless $item->{msgmessageid};
+      if (my $draftmsgs = $drafts{$item->{msgmessageid}}) {
         push @msgs, @$draftmsgs;
         $seenmsgs{$_} = 1 for @$draftmsgs;
       }
     }
     # make sure unlinked drafts aren't forgotten!
     foreach my $item (@$data) {
-      next if $seenmsgs{$item->[0]};
-      push @msgs, $item->[0];
-      $seenmsgs{$item->[0]} = 1;
+      next if $seenmsgs{$item->{msgid}};
+      push @msgs, $item->{msgid};
+      $seenmsgs{$item->{msgid}} = 1;
     }
     push @list, {
       id => "$thrid",
@@ -1037,11 +1322,13 @@ sub getThreads {
     push @allmsgs, @msgs;
   }
 
+  $Self->commit();
+
   my @res;
   push @res, ['threads', {
     list => \@list,
     accountId => $accountid,
-    state => "$user->{jhighestmodseq}",
+    state => $newState,
     notFound => (%missingids ? [keys %missingids] : undef),
   }];
 
@@ -1060,40 +1347,43 @@ sub getThreadUpdates {
   my $Self = shift;
   my $args = shift;
 
+  $Self->begin();
   my $dbh = $Self->{db}->dbh();
 
   my $user = $Self->{db}->get_user();
   my $accountid = $Self->{db}->accountid();
-  return ['error', {type => 'accountNotFound'}]
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
     if ($args->{accountId} and $args->{accountId} ne $accountid);
 
-  return ['error', {type => 'invalidArguments'}]
+  my $newState = "$user->{jstateThread}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
     if not $args->{sinceState};
-  return ['error', {type => 'cannotCalculateChanges'}]
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
     if ($user->{jdeletedmodseq} and $args->{sinceState} <= $user->{jdeletedmodseq});
 
-  my $sql = "SELECT thrid,active FROM jmessages WHERE jmodseq > ?";
+  my $sql = "SELECT * FROM jmessages WHERE jmodseq > ?";
 
   if ($args->{maxChanges}) {
     $sql .= " LIMIT " . (int($args->{maxChanges}) + 1);
   }
 
-  my $data = $dbh->selectall_arrayref($sql, {}, $args->{sinceState});
+  my $data = $dbh->selectall_arrayref($sql, {Slice => {}}, $args->{sinceState});
 
   if ($args->{maxChanges} and @$data > $args->{maxChanges}) {
-    return ['error', {type => 'tooManyChanges'}];
+    return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}]);
   }
 
   my %threads;
   my %delcheck;
   foreach my $row (@$data) {
-    $threads{$row->[0]} = 1;
-    $delcheck{$row->[0]} = 1 unless $row->[1];
+    $threads{$row->{msgid}} = 1;
+    $delcheck{$row->{msgid}} = 1 unless $row->{active};
   }
 
   my @removed;
   foreach my $key (keys %delcheck) {
-    my ($exists) = $dbh->selectrow_array("SELECT COUNT(*) FROM jmessages WHERE thrid = ? AND active = 1", {}, $key);
+    my ($exists) = $dbh->selectrow_array("SELECT COUNT(DISTINCT msgid) FROM jmessages JOIN jmessagemap WHERE thrid = ? AND jmessages.active = 1 AND jmessagemap.active = 1", {}, $key);
     unless ($exists) {
       delete $threads{$key};
       push @removed, $key;
@@ -1102,16 +1392,18 @@ sub getThreadUpdates {
 
   my @changed = keys %threads;
 
+  $Self->commit();
+
   my @res;
   push @res, ['threadUpdates', {
     accountId => $accountid,
     oldState => $args->{sinceState},
-    newState => "$user->{jhighestmodseq}",
+    newState => $newState,
     changed => \@changed,
     removed => \@removed,
   }];
 
-  if ($args->{fetchThreads}) {
+  if ($args->{fetchRecords}) {
     push @res, $Self->getThreads({
       accountid => $accountid,
       ids => \@changed,
@@ -1128,6 +1420,952 @@ sub _prop_wanted {
   return 1 unless $args->{properties};
   return 1 if grep { $_ eq $prop } @{$args->{properties}};
   return 0;
+}
+
+sub getCalendarPreferences {
+  return ['calendarPreferences', {
+    autoAddCalendarId         => '',
+    autoAddInvitations        => JSON::false,
+    autoAddGroupId            => JSON::null,
+    autoRSVPGroupId           => JSON::null,
+    autoRSVP                  => JSON::false,
+    autoUpdate                => JSON::false,
+    birthdaysAreVisible       => JSON::false,
+    defaultAlerts             => [],
+    defaultAllDayAlerts       => [],
+    defaultCalendarId         => '',
+    firstDayOfWeek            => 1,
+    markReadAndFileAutoAdd    => JSON::false,
+    markReadAndFileAutoUpdate => JSON::false,
+    onlyAutoAddIfInGroup      => JSON::false,
+    onlyAutoRSVPIfInGroup     => JSON::false,
+    showWeekNumbers           => JSON::false,
+    timeZone                  => JSON::null,
+    useTimeZones              => JSON::false,
+  }];
+}
+
+sub getCalendars {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateCalendar}";
+
+  my $data = $dbh->selectall_arrayref("SELECT jcalendarid, name, color, isVisible, mayReadFreeBusy, mayReadItems, mayAddItems, mayModifyItems, mayRemoveItems, mayDelete, mayRename FROM jcalendars WHERE active = 1");
+
+  my %ids;
+  if ($args->{ids}) {
+    %ids = map { $Self->idmap($_) => 1 } @{$args->{ids}};
+  }
+  else {
+    %ids = map { $_->[0] => 1 } @$data;
+  }
+
+  my @list;
+
+  foreach my $item (@$data) {
+    next unless delete $ids{$item->[0]};
+
+    my %rec = (
+      id => "$item->[0]",
+      name => $item->[1],
+      color => $item->[2],
+      isVisible => $item->[3] ? $JSON::true : $JSON::false,
+      mayReadFreeBusy => $item->[4] ? $JSON::true : $JSON::false,
+      mayReadItems => $item->[5] ? $JSON::true : $JSON::false,
+      mayAddItems => $item->[6] ? $JSON::true : $JSON::false,
+      mayModifyItems => $item->[7] ? $JSON::true : $JSON::false,
+      mayRemoveItems => $item->[8] ? $JSON::true : $JSON::false,
+      mayDelete => $item->[9] ? $JSON::true : $JSON::false,
+      mayRename => $item->[10] ? $JSON::true : $JSON::false,
+    );
+
+    foreach my $key (keys %rec) {
+      delete $rec{$key} unless _prop_wanted($args, $key);
+    }
+
+    push @list, \%rec;
+  }
+  my %missingids = %ids;
+
+  $Self->commit();
+
+  return ['calendars', {
+    list => \@list,
+    accountId => $accountid,
+    state => $newState,
+    notFound => (%missingids ? [map { "$_" } keys %missingids] : undef),
+  }];
+}
+
+sub getCalendarUpdates {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateCalendar}";
+
+  my $sinceState = $args->{sinceState};
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if not $args->{sinceState};
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
+    if ($user->{jdeletedmodseq} and $sinceState <= $user->{jdeletedmodseq});
+
+  my $data = $dbh->selectall_arrayref("SELECT jcalendarid, jmodseq, active FROM jcalendars ORDER BY jcalendarid");
+
+  my @changed;
+  my @removed;
+  my $onlyCounts = 1;
+  foreach my $item (@$data) {
+    if ($item->[1] > $sinceState) {
+      if ($item->[3]) {
+        push @changed, $item->[0];
+        $onlyCounts = 0;
+      }
+      else {
+        push @removed, $item->[0];
+      }
+    }
+    elsif (($item->[2] || 0) > $sinceState) {
+      if ($item->[3]) {
+        push @changed, $item->[0];
+      }
+      else {
+        push @removed, $item->[0];
+      }
+    }
+  }
+
+  $Self->commit();
+
+  my @res = (['calendarUpdates', {
+    accountId => $accountid,
+    oldState => "$sinceState",
+    newState => $newState,
+    changed => [map { "$_" } @changed],
+    removed => [map { "$_" } @removed],
+  }]);
+
+  if (@changed and $args->{fetchRecords}) {
+    my %items = (
+      accountid => $accountid,
+      ids => \@changed,
+    );
+    push @res, $Self->getCalendars(\%items);
+  }
+
+  return @res;
+}
+
+sub _event_match {
+  my $Self = shift;
+  my ($item, $condition, $storage) = @_;
+
+  # XXX - condition handling code
+  if ($condition->{inCalendars}) {
+    my $match = 0;
+    foreach my $id (@{$condition->{inCalendars}}) {
+      next unless $item->[1] eq $id;
+      $match = 1;
+    }
+    return 0 unless $match;
+  }
+
+  return 1;
+}
+
+sub _event_filter {
+  my $Self = shift;
+  my ($data, $filter, $storage) = @_;
+  my @res;
+  foreach my $item (@$data) {
+    next unless $Self->_event_match($item, $filter, $storage);
+    push @res, $item;
+  }
+  return \@res;
+}
+
+sub getCalendarEventList {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateCalendarEvent}";
+
+  my $start = $args->{position} || 0;
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if $start < 0;
+
+  my $data = $dbh->selectall_arrayref("SELECT eventuid,jcalendarid FROM jevents WHERE active = 1 ORDER BY eventuid");
+
+  $data = $Self->_event_filter($data, $args->{filter}, {}) if $args->{filter};
+
+  my $end = $args->{limit} ? $start + $args->{limit} - 1 : $#$data;
+  $end = $#$data if $end > $#$data;
+
+  my @result = map { $data->[$_][0] } $start..$end;
+
+  $Self->commit();
+
+  my @res;
+  push @res, ['calendarEventList', {
+    accountId => $accountid,
+    filter => $args->{filter},
+    state => $newState,
+    position => $start,
+    total => scalar(@$data),
+    calendarEventIds => [map { "$_" } @result],
+  }];
+
+  if ($args->{fetchCalendarEvents}) {
+    push @res, $Self->getCalendarEvents({
+      ids => \@result,
+      properties => $args->{fetchCalendarEventProperties},
+    }) if @result;
+  }
+
+  return @res;
+}
+
+sub getCalendarEvents {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateCalendarEvent}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    unless $args->{ids};
+  #properties: String[] A list of properties to fetch for each message.
+
+  my %seenids;
+  my %missingids;
+  my @list;
+  foreach my $eventid (map { $Self->idmap($_) } @{$args->{ids}}) {
+    next if $seenids{$eventid};
+    $seenids{$eventid} = 1;
+    my $data = $dbh->selectrow_hashref("SELECT * FROM jevents WHERE eventuid = ?", {}, $eventid);
+    unless ($data) {
+      $missingids{$eventid} = 1;
+      next;
+    }
+
+    my $item = decode_json($data->{payload});
+
+    foreach my $key (keys %$item) {
+      delete $item->{$key} unless _prop_wanted($args, $key);
+    }
+
+    $item->{id} = $eventid;
+    $item->{calendarId} = "$data->{jcalendarid}" if _prop_wanted($args, "calendarId");
+
+    push @list, $item;
+  }
+
+  $Self->commit();
+
+  return ['calendarEvents', {
+    list => \@list,
+    accountId => $accountid,
+    state => $newState,
+    notFound => (%missingids ? [keys %missingids] : undef),
+  }];
+}
+
+sub getCalendarEventUpdates {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateCalendarEvent}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if not $args->{sinceState};
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
+    if ($user->{jdeletedmodseq} and $args->{sinceState} <= $user->{jdeletedmodseq});
+
+  my $sql = "SELECT eventuid,active FROM jevents WHERE jmodseq > ?";
+
+  my $data = $dbh->selectall_arrayref($sql, {}, $args->{sinceState});
+
+  if ($args->{maxChanges} and @$data > $args->{maxChanges}) {
+    return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}]);
+  }
+
+  $Self->commit();
+
+  my @changed;
+  my @removed;
+
+  foreach my $row (@$data) {
+    if ($row->[1]) {
+      push @changed, $row->[0];
+    }
+    else {
+      push @removed, $row->[0];
+    }
+  }
+
+  my @res;
+  push @res, ['calendarEventUpdates', {
+    accountId => $accountid,
+    oldState => "$args->{sinceState}",
+    newState => $newState,
+    changed => [map { "$_" } @changed],
+    removed => [map { "$_" } @removed],
+  }];
+
+  if ($args->{fetchCalendarEvents}) {
+    push @res, $Self->getCalendarEvents({
+      accountid => $accountid,
+      ids => \@changed,
+      properties => $args->{fetchCalendarEventProperties},
+    }) if @changed;
+  }
+
+  return @res;
+}
+
+sub getAddressbooks {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  # we have no datatype for this yet
+  my $newState = "$user->{jhighestmodseq}";
+
+  my $data = $dbh->selectall_arrayref("SELECT jaddressbookid, name, isVisible, mayReadItems, mayAddItems, mayModifyItems, mayRemoveItems, mayDelete, mayRename FROM jaddressbooks WHERE active = 1");
+
+  my %ids;
+  if ($args->{ids}) {
+    %ids = map { $Self->($_) => 1 } @{$args->{ids}};
+  }
+  else {
+    %ids = map { $_->[0] => 1 } @$data;
+  }
+
+  my @list;
+
+  foreach my $item (@$data) {
+    next unless delete $ids{$item->[0]};
+
+    my %rec = (
+      id => "$item->[0]",
+      name => $item->[1],
+      isVisible => $item->[2] ? $JSON::true : $JSON::false,
+      mayReadItems => $item->[3] ? $JSON::true : $JSON::false,
+      mayAddItems => $item->[4] ? $JSON::true : $JSON::false,
+      mayModifyItems => $item->[5] ? $JSON::true : $JSON::false,
+      mayRemoveItems => $item->[6] ? $JSON::true : $JSON::false,
+      mayDelete => $item->[7] ? $JSON::true : $JSON::false,
+      mayRename => $item->[8] ? $JSON::true : $JSON::false,
+    );
+
+    foreach my $key (keys %rec) {
+      delete $rec{$key} unless _prop_wanted($args, $key);
+    }
+
+    push @list, \%rec;
+  }
+  my %missingids = %ids;
+
+  $Self->commit();
+
+  return ['addressbooks', {
+    list => \@list,
+    accountId => $accountid,
+    state => $newState,
+    notFound => (%missingids ? [map { "$_" } keys %missingids] : undef),
+  }];
+}
+
+sub getAddressbookUpdates {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  # we have no datatype for you yet
+  my $newState = "$user->{jhighestmodseq}";
+
+  my $sinceState = $args->{sinceState};
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if not $args->{sinceState};
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
+    if ($user->{jdeletedmodseq} and $sinceState <= $user->{jdeletedmodseq});
+
+  my $data = $dbh->selectall_arrayref("SELECT jaddressbookid, jmodseq, active FROM jaddressbooks ORDER BY jaddressbookid");
+
+  my @changed;
+  my @removed;
+  my $onlyCounts = 1;
+  foreach my $item (@$data) {
+    if ($item->[1] > $sinceState) {
+      if ($item->[3]) {
+        push @changed, $item->[0];
+        $onlyCounts = 0;
+      }
+      else {
+        push @removed, $item->[0];
+      }
+    }
+    elsif (($item->[2] || 0) > $sinceState) {
+      if ($item->[3]) {
+        push @changed, $item->[0];
+      }
+      else {
+        push @removed, $item->[0];
+      }
+    }
+  }
+
+  $Self->commit();
+
+  my @res = (['addressbookUpdates', {
+    accountId => $accountid,
+    oldState => "$sinceState",
+    newState => $newState,
+    changed => [map { "$_" } @changed],
+    removed => [map { "$_" } @removed],
+  }]);
+
+  if (@changed and $args->{fetchRecords}) {
+    my %items = (
+      accountid => $accountid,
+      ids => \@changed,
+    );
+    push @res, $Self->getAddressbooks(\%items);
+  }
+
+  return @res;
+}
+
+sub _contact_match {
+  my $Self = shift;
+  my ($item, $condition, $storage) = @_;
+
+  # XXX - condition handling code
+  if ($condition->{inAddressbooks}) {
+    my $match = 0;
+    foreach my $id (@{$condition->{inAddressbooks}}) {
+      next unless $item->[1] eq $id;
+      $match = 1;
+    }
+    return 0 unless $match;
+  }
+
+  return 1;
+}
+
+sub _contact_filter {
+  my $Self = shift;
+  my ($data, $filter, $storage) = @_;
+  my @res;
+  foreach my $item (@$data) {
+    next unless $Self->_contact_match($item, $filter, $storage);
+    push @res, $item;
+  }
+  return \@res;
+}
+
+sub getContactList {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateContact}";
+
+  my $start = $args->{position} || 0;
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if $start < 0;
+
+  my $data = $dbh->selectall_arrayref("SELECT contactuid,jaddressbookid FROM jcontacts WHERE active = 1 ORDER BY contactuid");
+
+  $data = $Self->_event_filter($data, $args->{filter}, {}) if $args->{filter};
+
+  my $end = $args->{limit} ? $start + $args->{limit} - 1 : $#$data;
+  $end = $#$data if $end > $#$data;
+
+  my @result = map { $data->[$_][0] } $start..$end;
+
+  $Self->commit();
+
+  my @res;
+  push @res, ['contactList', {
+    accountId => $accountid,
+    filter => $args->{filter},
+    state => $newState,
+    position => $start,
+    total => scalar(@$data),
+    contactIds => [map { "$_" } @result],
+  }];
+
+  if ($args->{fetchContacts}) {
+    push @res, $Self->getContacts({
+      ids => \@result,
+      properties => $args->{fetchContactProperties},
+    }) if @result;
+  }
+
+  return @res;
+}
+
+sub getContacts {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateContact}";
+
+  #properties: String[] A list of properties to fetch for each message.
+
+  my $data = $dbh->selectall_hashref("SELECT * FROM jcontacts WHERE active = 1", 'contactuid', {Slice => {}});
+
+  my %want;
+  if ($args->{ids}) {
+    %want = map { $Self->idmap($_) => 1 } @{$args->{ids}};
+  }
+  else {
+    %want = %$data;
+  }
+
+  my @list;
+  foreach my $id (keys %want) {
+    next unless $data->{$id};
+    delete $want{$id};
+
+    my $item = decode_json($data->{$id}{payload});
+
+    foreach my $key (keys %$item) {
+      delete $item->{$key} unless _prop_wanted($args, $key);
+    }
+
+    $item->{id} = $id;
+
+    push @list, $item;
+  }
+  $Self->commit();
+
+  return ['contacts', {
+    list => \@list,
+    accountId => $accountid,
+    state => $newState,
+    notFound => (%want ? [keys %want] : undef),
+  }];
+}
+
+sub getContactUpdates {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateContact}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if not $args->{sinceState};
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
+    if ($user->{jdeletedmodseq} and $args->{sinceState} <= $user->{jdeletedmodseq});
+
+  my $sql = "SELECT contactuid,active FROM jcontacts WHERE jmodseq > ?";
+
+  my $data = $dbh->selectall_arrayref($sql, {}, $args->{sinceState});
+
+  if ($args->{maxChanges} and @$data > $args->{maxChanges}) {
+    return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}]);
+  }
+  $Self->commit();
+
+  my @changed;
+  my @removed;
+
+  foreach my $row (@$data) {
+    if ($row->[1]) {
+      push @changed, $row->[0];
+    }
+    else {
+      push @removed, $row->[0];
+    }
+  }
+
+  my @res;
+  push @res, ['contactUpdates', {
+    accountId => $accountid,
+    oldState => "$args->{sinceState}",
+    newState => $newState,
+    changed => [map { "$_" } @changed],
+    removed => [map { "$_" } @removed],
+  }];
+
+  if ($args->{fetchRecords}) {
+    push @res, $Self->getContacts({
+      accountid => $accountid,
+      ids => \@changed,
+      properties => $args->{fetchRecordProperties},
+    }) if @changed;
+  }
+
+  return @res;
+}
+
+sub getContactGroups {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateContactGroup}";
+
+  #properties: String[] A list of properties to fetch for each message.
+
+  my $data = $dbh->selectall_hashref("SELECT * FROM jcontactgroups WHERE active = 1", 'groupuid', {Slice => {}});
+
+  my %want;
+  if ($args->{ids}) {
+    %want = map { $Self->idmap($_) => 1 } @{$args->{ids}};
+  }
+  else {
+    %want = %$data;
+  }
+
+  my @list;
+  foreach my $id (keys %want) {
+    next unless $data->{$id};
+    delete $want{$id};
+
+    my $item = {};
+    $item->{id} = $id;
+
+    if (_prop_wanted($args, 'name')) {
+      $item->{name} = $data->{$id}{name};
+    }
+
+    if (_prop_wanted($args, 'contactIds')) {
+      my $ids = $dbh->selectcol_arrayref("SELECT contactuid FROM jcontactgroupmap WHERE groupuid = ?", {}, $id);
+      $item->{contactIds} = $ids;
+    }
+
+    push @list, $item;
+  }
+  $Self->commit();
+
+  return ['contactGroups', {
+    list => \@list,
+    accountId => $accountid,
+    state => $newState,
+    notFound => (%want ? [keys %want] : undef),
+  }];
+}
+
+sub getContactGroupUpdates {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+  my $dbh = $Self->{db}->dbh();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  my $newState = "$user->{jstateContactGroup}";
+
+  return $Self->_transError(['error', {type => 'invalidArguments'}])
+    if not $args->{sinceState};
+  return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}])
+    if ($user->{jdeletedmodseq} and $args->{sinceState} <= $user->{jdeletedmodseq});
+
+  my $sql = "SELECT groupuid,active FROM jcontactgroups WHERE jmodseq > ?";
+
+  my $data = $dbh->selectall_arrayref($sql, {}, $args->{sinceState});
+
+  if ($args->{maxChanges} and @$data > $args->{maxChanges}) {
+    return $Self->_transError(['error', {type => 'cannotCalculateChanges', newState => $newState}]);
+  }
+
+  my @changed;
+  my @removed;
+
+  foreach my $row (@$data) {
+    if ($row->[1]) {
+      push @changed, $row->[0];
+    }
+    else {
+      push @removed, $row->[0];
+    }
+  }
+  $Self->commit();
+
+  my @res;
+  push @res, ['contactGroupUpdates', {
+    accountId => $accountid,
+    oldState => "$args->{sinceState}",
+    newState => $newState,
+    changed => [map { "$_" } @changed],
+    removed => [map { "$_" } @removed],
+  }];
+
+  if ($args->{fetchRecords}) {
+    push @res, $Self->getContactGroups({
+      accountid => $accountid,
+      ids => \@changed,
+      properties => $args->{fetchRecordProperties},
+    }) if @changed;
+  }
+
+  return @res;
+}
+
+sub setContactGroups {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  $Self->commit();
+
+  my $create = $args->{create} || {};
+  my $update = $args->{update} || {};
+  my $destroy = $args->{destroy} || [];
+
+  $Self->{db}->begin_superlock();
+
+  my ($created, $notCreated) = $Self->{db}->create_contact_groups($create);
+  $Self->setid($_, $created->{$_}{id}) for keys %$created;
+  my ($updated, $notUpdated) = $Self->{db}->update_contact_groups($update, sub { $Self->idmap(shift) });
+  my ($destroyed, $notDestroyed) = $Self->{db}->destroy_contact_groups($destroy);
+
+  $Self->{db}->sync_addressbooks();
+
+  $Self->{db}->end_superlock();
+
+  my @res;
+  push @res, ['contactGroupsSet', {
+    accountId => $accountid,
+    oldState => undef, # proxy can't guarantee the old state
+    newState => undef, # or give a new state
+    created => $created,
+    notCreated => $notCreated,
+    updated => $updated,
+    notUpdated => $notUpdated,
+    destroyed => $destroyed,
+    notDestroyed => $notDestroyed,
+  }];
+
+  return @res;
+}
+
+sub setContacts {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  $Self->commit();
+
+  my $create = $args->{create} || {};
+  my $update = $args->{update} || {};
+  my $destroy = $args->{destroy} || [];
+
+  $Self->{db}->begin_superlock();
+
+  my ($created, $notCreated) = $Self->{db}->create_contacts($create);
+  $Self->setid($_, $created->{$_}{id}) for keys %$created;
+  my ($updated, $notUpdated) = $Self->{db}->update_contacts($update, sub { $Self->idmap(shift) });
+  my ($destroyed, $notDestroyed) = $Self->{db}->destroy_contacts($destroy);
+
+  $Self->{db}->sync_addressbooks();
+
+  $Self->{db}->end_superlock();
+
+  my @res;
+  push @res, ['contactsSet', {
+    accountId => $accountid,
+    oldState => undef, # proxy can't guarantee the old state
+    newState => undef, # or give a new state
+    created => $created,
+    notCreated => $notCreated,
+    updated => $updated,
+    notUpdated => $notUpdated,
+    destroyed => $destroyed,
+    notDestroyed => $notDestroyed,
+  }];
+
+  return @res;
+}
+
+sub setCalendarEvents {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  $Self->commit();
+
+  my $create = $args->{create} || {};
+  my $update = $args->{update} || {};
+  my $destroy = $args->{destroy} || [];
+
+  $Self->{db}->begin_superlock();
+
+  my ($created, $notCreated) = $Self->{db}->create_calendar_events($create);
+  $Self->setid($_, $created->{$_}{id}) for keys %$created;
+  my ($updated, $notUpdated) = $Self->{db}->update_calendar_events($update, sub { $Self->idmap(shift) });
+  my ($destroyed, $notDestroyed) = $Self->{db}->destroy_calendar_events($destroy);
+
+  $Self->{db}->sync_calendars();
+
+  $Self->{db}->end_superlock();
+
+  my @res;
+  push @res, ['calendarEventsSet', {
+    accountId => $accountid,
+    oldState => undef, # proxy can't guarantee the old state
+    newState => undef, # or give a new state
+    created => $created,
+    notCreated => $notCreated,
+    updated => $updated,
+    notUpdated => $notUpdated,
+    destroyed => $destroyed,
+    notDestroyed => $notDestroyed,
+  }];
+
+  return @res;
+}
+
+sub setCalendars {
+  my $Self = shift;
+  my $args = shift;
+
+  $Self->begin();
+
+  my $user = $Self->{db}->get_user();
+  my $accountid = $Self->{db}->accountid();
+  return $Self->_transError(['error', {type => 'accountNotFound'}])
+    if ($args->{accountId} and $args->{accountId} ne $accountid);
+
+  $Self->commit();
+
+  my $create = $args->{create} || {};
+  my $update = $args->{update} || {};
+  my $destroy = $args->{destroy} || [];
+
+  $Self->{db}->begin_superlock();
+
+  my ($created, $notCreated) = $Self->{db}->create_calendars($create);
+  $Self->setid($_, $created->{$_}{id}) for keys %$created;
+  my ($updated, $notUpdated) = $Self->{db}->update_calendars($update, sub { $Self->idmap(shift) });
+  my ($destroyed, $notDestroyed) = $Self->{db}->destroy_calendars($destroy);
+
+  $Self->{db}->sync_calendars();
+
+  $Self->{db}->end_superlock();
+
+  my @res;
+  push @res, ['calendarsSet', {
+    accountId => $accountid,
+    oldState => undef, # proxy can't guarantee the old state
+    newState => undef, # or give a new state
+    created => $created,
+    notCreated => $notCreated,
+    updated => $updated,
+    notUpdated => $notUpdated,
+    destroyed => $destroyed,
+    notDestroyed => $notDestroyed,
+  }];
+
+  return @res;
 }
 
 1;

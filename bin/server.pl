@@ -18,20 +18,21 @@ use AnyEvent::Handle;
 use AnyEvent::Socket;
 use AnyEvent::Util;
 use AnyEvent::HTTP;
-use JMAP::GmailDB;
-use JSON::XS qw(encode_json decode_json);
+use JMAP::Sync::Gmail;
+use JSON::XS qw(decode_json);
 use Encode qw(encode_utf8);
+use Template;
+my $TT = Template->new(INCLUDE_PATH => '/home/jmap/jmap-perl/htdocs');
+
+my $json = JSON::XS->new->utf8->canonical();
 
 sub mkerr {
   my $req = shift;
   return sub {
     my $error = shift;
-    open(FH, "/home/jmap/jmap-perl/htdocs/error.html");
-    local $/ = undef;
-    my $html = <FH>;
-    close(FH);
+    my $html = '';
     $error =~ s{at (/|bin/).*}{}s;
-    $html =~ s/\$ERROR/$error/gs;
+    $TT->process("error.html", { error => $error }, \$html) || die $Template::ERROR;
     $req->respond({content => ['text/html', $html]});
   };
 }
@@ -42,10 +43,10 @@ sub idler {
   my $accountid = shift;
   my $edgecb = shift;
 
-  send_backend_request($accountid, 'gettoken', $accountid, sub {
+  send_backend_request("$accountid:sync", 'gettoken', $accountid, sub {
     my ($data) = @_;
     if ($data) {
-      my $imap = $data->[0] eq 'gmail' ? AnyEvent::Gmail->new(
+      my $imap = $data->[0] eq 'imap.gmail.com' ? AnyEvent::Gmail->new(
         host => 'imap.gmail.com',
         user => $data->[1],
         token => $data->[2],
@@ -63,6 +64,7 @@ sub idler {
         connect => sub {
           $imap->login()->cb(sub {
             my ($ok, $line) = shift->recv;
+            warn "LOGIN $data->[1]: $ok @$line\n";
             if ($ok) {
               setup_examine($edgecb, $imap);
             }
@@ -78,6 +80,10 @@ sub idler {
       $imap->connect();
 
       $idler{$accountid}{idler} = $imap;
+
+      $idler{$accountid}{dav} = AnyEvent->timer(after => 1, interval => 300, cb => sub {
+        send_backend_request("$accountid:dav", 'davsync', $accountid, sub { });
+      });
     }
     else {
       # clean up so next attempt will try again
@@ -90,12 +96,10 @@ sub setup_examine {
   my $edgecb = shift;
   my $imap = shift;
 
-  $imap->send_cmd('ENABLE CONDSTORE', sub {
-    $imap->send_cmd('SELECT "INBOX"', sub {
-      $edgecb->("initial");
+  $imap->send_cmd('SELECT "INBOX"', sub {
+    $edgecb->("initial");
 
-      setup_idle($edgecb, $imap);
-    });
+    setup_idle($edgecb, $imap);
   });
 }
 
@@ -135,17 +139,13 @@ sub read_idle_line {
   });
 }
 
-my $json = JSON::XS->new->allow_nonref->pretty->canonical;
-
 my $httpd = AnyEvent::HTTPD->new (port => 9000);
 
 my %backend;
 
 $httpd->reg_cb (
   '/jmap' => \&do_jmap,
-  '/A' => \&do_A,
-  '/J' => \&do_J,
-  '/U' => \&do_U,
+  '/upload' => \&do_upload,
   '/raw' => \&do_raw,
   '/register' => \&do_register,
   '/delete' => \&do_delete,
@@ -164,10 +164,15 @@ sub mk_json {
     if ($res->[0] eq 'push') {
       PushEvent($accountid, event => "state", data => $res->[1]);
     }
+    elsif ($res->[0] eq 'bye') {
+      print "SERVER CLOSING $accountid\n";
+      delete $backend{$accountid};
+    }
     elsif ($waiting{$accountid}{$res->[2]}) {
       if ($res->[0] eq 'error') {
         $waiting{$accountid}{$res->[2]}[1]->($res->[1]);
         # start again...
+        print "ERROR $res->[1] on $accountid (dropping backend)\n";
         delete $backend{$accountid};
       }
       else {
@@ -193,7 +198,7 @@ sub get_backend {
       connect => ['127.0.0.1', 5000],
       on_error => sub {
         print "CLOSING ON ERROR $accountid\n";
-	delete $backend{$accountid};
+        delete $backend{$accountid};
       },
       on_disconnect => sub {
         print "CLOSING ON DISCONNECT $accountid\n";
@@ -208,12 +213,13 @@ sub get_backend {
 
 sub send_backend_request {
   my $accountid = shift;
-  my $request = shift; 
+  my $request = shift;
   my $args = shift;
   my $cb = shift;
   my $errcb = shift;
   my $backend = get_backend($accountid);
   my $cmd = "#" . $backend->[1]++;
+  warn "SENDING $accountid $request\n";
   $waiting{$accountid}{$cmd} = [$cb || sub {return 1}, $errcb || sub {return 1}];
   $backend->[0]->push_write(json => [$request, $args, $cmd]);
 }
@@ -311,67 +317,17 @@ sub do_raw {
   }, mkerr($req));
 }
 
-sub _getaccountid {
-  my $req = shift;
-  my $header = $req->headers->{"authorization"};
-  $header =~ s/^Token //;
-  return $header;
-}
-
-sub do_A {
+sub do_upload {
   my ($httpd, $req) = @_;
 
-  return not_found($req) unless $req->method eq 'post';
+  my $uri = $req->url();
+  my $path = $uri->path();
 
-  my $content = $req->content();
-  return invalid_request($req) unless $content;
-  my $request = eval { $json->decode($content) };
-  return invalid_request($req) unless ($request and ref($request) eq 'HASH');
+  return not_found($req) unless $path =~ m{^/upload/([^/]+)};
 
-  # more validation?
+  my $accountid = $1;
 
-  $httpd->stop_request();
-
-  send_backend_request("A", 'authenticate', $request, sub {
-    my $res = shift;
-    my $html = encode_utf8($json->encode($res));
-    $req->respond ({ content => ['application/json', $html] });
-    return 1;
-  }, mkerr($req));
-}
-
-sub do_J {
-  my ($httpd, $req) = @_;
-
-  return not_found($req) unless $req->method eq 'post';
-
-  my $accountid = _getaccountid($req);
-  return need_auth($req) unless $accountid;
-
-  prod_idler($accountid);
-
-  my $content = $req->content();
-  return invalid_request($req) unless $content;
-  my $request = eval { $json->decode($content) };
-  return invalid_request($req) unless ($request and ref($request) eq 'ARRAY');
-
-  $httpd->stop_request();
-
-  send_backend_request($accountid, 'jmap', $request, sub {
-    my $res = shift;
-    my $html = encode_utf8($json->encode($res));
-    $req->respond ({ content => ['application/json', $html] });
-    return 1;
-  }, mkerr($req));
-}
-
-sub do_U {
-  my ($httpd, $req) = @_;
-
-  return not_found($req) unless $req->method eq 'post';
-
-  my $accountid = _getaccountid($req);
-  return need_auth($req) unless $accountid;
+  return client_page($req, $accountid) unless lc $req->method eq 'post';
 
   prod_idler($accountid);
 
@@ -384,8 +340,8 @@ sub do_U {
 
   send_backend_request($accountid, 'upload', [$type, $content], sub {
     my $res = shift;
-    my $html = encode_utf8($json->encode($res));
-    $req->respond ({ content => ['application/json', $html] });
+    my $response = encode_utf8($json->encode($res));
+    $req->respond ({ content => ['application/json', $response] });
     return 1;
   }, mkerr($req));
 }
@@ -430,28 +386,23 @@ sub client_page {
     my $data = shift;
 
     prod_idler($accountid);
+    send_backend_request($accountid, 'syncall');
 
-    open(FH, "/home/jmap/jmap-perl/htdocs/landing.html");
-    local $/ = undef;
-    my $html = <FH>;
-    close(FH);
-
-    $html =~ s{\$INFO}{Account: <b>$data->[0] ($data->[1])</b>}gs;
-    $html =~ s/\$UUID/$accountid/gs;
-    $req->respond ({ content => ['text/html', $html] });
+    my $html = '';
+    $TT->process("landing.html", {
+      info => "Account: <b>$data->[0] ($data->[1])</b>",
+      uuid => $accountid,
+      jmaphost => $ENV{jmaphost},
+     }, \$html) || die $Template::ERROR;
+    $req->respond({content => ['text/html', $html]});
   }, sub {
     my $cookie = bake_cookie("jmap_$accountid", {value => '', path => '/'});
-    $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://proxy.jmap.io/" }, "Redirected"]);
+    $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://$ENV{jmaphost}/" }, "Redirected"]);
   });
 }
 
 sub home_page {
   my ($httpd, $req) = @_;
-
-  open(FH, "/home/jmap/jmap-perl/htdocs/index.html");
-  local $/ = undef;
-  my $html = <FH>;
-  close(FH);
 
   my $sessiontext = '';
   my @text;
@@ -470,13 +421,16 @@ sub home_page {
 </tr>
 EOF
     foreach my $key (sort keys %ids) {
-      $sessiontext .= qq{<tr>\n <td><a href="https://proxy.jmap.io/jmap/$key/">$ids{$key}</a>\n </td>\n</tr>\n};
+      $sessiontext .= qq{<tr>\n <td><a href="https://$ENV{jmaphost}/jmap/$key/">$ids{$key}</a>\n </td>\n</tr>\n};
     }
     $sessiontext .= "</table>";
   }
-
-  $html =~ s/\$SESSIONS/$sessiontext/gs;
-  $req->respond ({ content => ['text/html', $html] });
+  my $html = '';
+  $TT->process("index.html", {
+    sessions => $sessiontext,
+    jmaphost => $ENV{jmaphost},
+   }, \$html) || die $Template::ERROR;
+  $req->respond({content => ['text/html', $html]});
 }
 
 sub need_auth {
@@ -576,16 +530,36 @@ sub HandleEventSource {
   });
 }
 
+
+sub prod_backfill {
+  my $accountid = shift;
+  my $force = shift;
+  return if (not $force and $idler{$accountid}{backfilling});
+  $idler{$accountid}{backfilling} = 1;
+    
+  my $timer;
+  $timer = AnyEvent->timer(after => 10, cb => sub {
+    send_backend_request("$accountid:backfill", 'backfill', $accountid, sub {
+      $timer = undef;
+      prod_backfill($accountid, @_);
+      # keep the idler running while we're backfilling
+      $idler{$accountid}{lastused} = time();
+    });
+  });
+}
+
 sub prod_idler {
   my $accountid = shift;
 
   unless ($idler{$accountid}) {
     idler($accountid,
       sub {
-        send_backend_request($accountid, 'sync', $accountid);
+        send_backend_request("$accountid:sync", 'sync', $accountid);
       },
     );
   }
+
+  prod_backfill($accountid);
 
   $idler{$accountid}{lastused} = time();
 }
@@ -593,12 +567,14 @@ sub prod_idler {
 sub PushToHandle {
   my $Handle = shift;
   my %vals = @_;
-  my @Lines = map { "$_: " . (ref($vals{$_}) ? encode_json($vals{$_}) : $vals{$_}) } keys %vals;
+  print "PUSH EVENT " . $json->encode(\%vals) . "\n";
+  my @Lines = map { "$_: " . (ref($vals{$_}) ? $json->encode($vals{$_}) : $vals{$_}) } keys %vals;
   $Handle->push_write(join("\r\n", @Lines) . "\r\n\r\n");
 }
 
 sub PushEvent {
   my $Channel = shift;
+  $Channel =~ s/:.*//;
   my %vals = @_;
   foreach my $Fd (keys %{$PushMap{$Channel}{handles}}) {
     my $ToHandle = $PushMap{$Channel}{handles}{$Fd};
@@ -624,7 +600,7 @@ sub ShutdownPushChannel {
 
 sub ShutdownHandle {
   my ($Handle, $Msg) = @_;
-  $Handle->push_write($Msg);
+  $Handle->push_write($Msg) if $Msg;
   $Handle->on_drain(sub { $Handle->destroy(); });
 }
 
@@ -639,15 +615,21 @@ sub HandleKeepAlive {
     next if $PushMap{$accountid}; # nothing to do
     if ($idler{$accountid}{lastused} < $Now - KEEPIDLE_TIME) {
       my $old = $idler{$accountid}{idler};
+      my $sync = delete $backend{"$accountid:sync"};
+      my $dav = delete $backend{"$accountid:dav"};
+      my $backfill = delete $backend{"$accountid:backfill"};
       delete $idler{$accountid};
       eval { $old->disconnect() };
+      eval { ShutdownHandle($sync) };
+      eval { ShutdownHandle($dav) };
+      eval { ShutdownHandle($backfill) };
     }
   }
 }
 
 sub do_register {
   my ($httpd, $req) = @_;
-  my $O = JMAP::GmailDB::O();
+  my $O = JMAP::Sync::Gmail::O();
   $req->respond({redirect => $O->start(new_uuid_string())});
 };
 
@@ -663,7 +645,7 @@ sub do_delete {
   if ($accountid) {
     send_backend_request($accountid, 'delete', $accountid, sub {
       my $cookie = bake_cookie("jmap_$accountid", {value => '', path => '/'});
-      $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://proxy.jmap.io/" }, "Redirected"]);
+      $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://$ENV{jmaphost}/" }, "Redirected"]);
     }, mkerr($req));
   }
 };
@@ -671,26 +653,33 @@ sub do_delete {
 sub do_signup {
   my ($httpd, $req) = @_;
 
-  my $host = $req->parm('host');
-  my $user = $req->parm('user');
-  my $pass = $req->parm('pass');
+  my $uri = $req->url();
+  my $path = $uri->path();
+
+  my %opts;
+  foreach my $key (qw(username password imapHost imapPort imapSSL smtpHost smtpPort smtpSSL caldavURL carddavURL force)) {
+    $opts{$key} = $req->parm($key);
+  }
 
   my $accountid = new_uuid_string();
-  send_backend_request($accountid, 'signup', [$host, $user, $pass], sub {
+  send_backend_request($accountid, 'signup', \%opts, sub {
     my ($data) = @_;
-    if ($data) {
-      my $cookie = bake_cookie("jmap_$data->[0]", {
-        value => $data->[1],
+    warn Dumper($data);
+    if ($data && $data->[0] eq 'done') {
+      send_backend_request($data->[0], 'sync', $data->[1]);
+      my $cookie = bake_cookie("jmap_$data->[1]", {
+        value => $data->[2],
         path => '/',
         expires => '+3M',
       });
-      $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://proxy.jmap.io/jmap/$data->[0]" },
+      $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://$ENV{jmaphost}/jmap/$data->[1]" },
                 "Redirected"]);
-      delete $backend{$accountid} unless $data->[0] eq $accountid;
-      send_backend_request($data->[0], 'sync', $data->[0]);
+      delete $backend{$accountid} unless $data->[1] eq $accountid;
     }
     else {
-      not_found($req);
+      my $html = '';
+      $TT->process("signup.html", $data->[1], \$html) || die $Template::ERROR;
+      $req->respond({content => ['text/html', $html]});
     }
     return 1;
   }, mkerr($req));
@@ -710,7 +699,7 @@ sub do_cb_google {
         path => '/',
         expires => '+3M',
       });
-      $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://proxy.jmap.io/jmap/$data->[0]" },
+      $req->respond([301, 'redirected', { 'Set-Cookie' => $cookie, Location => "https://$ENV{jmaphost}/jmap/$data->[0]" },
                 "Redirected"]);
       delete $backend{$accountid} unless $data->[0] eq $accountid;
       send_backend_request($data->[0], 'sync', $data->[0]);

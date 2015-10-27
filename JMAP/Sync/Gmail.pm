@@ -4,61 +4,69 @@ use strict;
 use warnings;
 
 package JMAP::Sync::Gmail;
-use base qw(JMAP::DB);
+use base qw(JMAP::Sync::Common);
 
 use Mail::GmailTalk;
-use JSON::XS qw(encode_json decode_json);
+use JSON::XS qw(decode_json);
 use Email::Simple;
 use Email::Sender::Simple qw(sendmail);
 use Email::Sender::Transport::GmailSMTP;
-use Net::GmailCalendars;
-use Net::GmailContacts;
+use Net::CalDAVTalk;
+use Net::CardDAVTalk;
+use OAuth2::Tiny;
+use IO::All;
 
-my %KNOWN_SPECIALS = map { lc $_ => 1 } qw(\\HasChildren \\HasNoChildren \\NoSelect);
-
-sub new {
-  my $Class = shift;
-  my $auth = shift;
-  return bless { auth => $auth }, ref($Class) || $Class;
-}
-
-sub DESTROY {
-  my $Self = shift;
-  if ($Self->{imap}) {
-    $Self->{imap}->logout();
+my $O;
+sub O {
+  unless ($O) {
+    my $data = io->file("/home/jmap/jmap-perl/config.json")->slurp;
+    my $config = decode_json($data);
+    $O = OAuth2::Tiny->new(%$config);
   }
+  return $O;
 }
 
-sub get_calendars {
+sub access_token {
+  my $Self = shift;
+  unless ($Self->{access_token}) {
+    my $refresh_token = $Self->{auth}{password};
+    my $O = $Self->O();
+    my $data = $O->refresh($refresh_token);
+    $Self->{access_token} = $data->{access_token};
+  }
+  return $Self->{access_token};
+}
+
+sub connect_calendars {
   my $Self = shift;
 
-  if ($self->{calendars}) {
+  if ($Self->{calendars}) {
     $Self->{lastused} = time();
     return $Self->{calendars};
   }
 
-  $Self->{calendars} = Net::GmailCalendars->new(
+  $Self->{calendars} = Net::CalDAVTalk->new(
     user => $Self->{auth}{username},
-    access_token => $Self->{auth}{access_token},
-    url => "https://apidata.googleusercontent.com/caldav/v2",
+    access_token => $Self->access_token(),
+    url => $Self->{auth}{caldavURL},
     expandurl => 1,
   );
 
   return $Self->{calendars};
 }
 
-sub get_contacts {
+sub connect_contacts {
   my $Self = shift;
 
-  if ($self->{contacts}) {
+  if ($Self->{contacts}) {
     $Self->{lastused} = time();
     return $Self->{contacts};
   }
 
-  $Self->{contacts} = Net::GmailContacts->new(
+  $Self->{contacts} = Net::CardDAVTalk->new(
     user => $Self->{auth}{username},
-    access_token => $Self->{auth}{access_token},
-    url => "https://www.googleapis.com/.well-known/carddav",
+    access_token => $Self->access_token(),
+    url => $Self->{auth}{carddavURL},
     expandurl => 1,
   );
 
@@ -74,33 +82,19 @@ sub connect_imap {
   }
 
   for (1..3) {
-    $Self->log('debug', "Looking for server for $Self->{auth}{username}");
-    my $port = 993;
-    my $usessl = $port != 143;  # we use SSL for anything except default
-    $Self->log('debug', "getting imaptalk");
+    my $port = $Self->{auth}{imapPort};
+    my $usessl = 1;
     $Self->{imap} = Mail::GmailTalk->new(
-      Server   => 'imap.gmail.com',
+      Server   => $Self->{auth}{imapHost},
       Port     => $port,
       Username => $Self->{auth}{username},
-      Password => $Self->{auth}{access_token},
+      Password => $Self->access_token(),
       # not configurable right now...
       UseSSL   => $usessl,
       UseBlocking => $usessl,
     );
     next unless $Self->{imap};
-    $Self->log('debug', "Connected as $Self->{auth}{username}");
     $Self->{lastused} = time();
-    my @folders = $Self->{imap}->xlist('', '*');
-
-    delete $Self->{folders};
-    delete $Self->{labels};
-    foreach my $folder (@folders) {
-      my ($role) = grep { not $KNOWN_SPECIALS{lc $_} } @{$folder->[0]};
-      my $name = $folder->[2];
-      my $label = $role || $folder->[2];
-      $Self->{folders}{$name} = $label;
-      $Self->{labels}{$label} = $name;
-    }
     return $Self->{imap};
   }
 
@@ -115,119 +109,47 @@ sub send_email {
   sendmail($email, {
     from => $Self->{auth}{username},
     transport => Email::Sender::Transport::GmailSMTP->new({
-      host => 'smtp.gmail.com',
-      port => 465,
+      helo => $ENV{jmaphost},
+      host => $Self->{auth}{smtpHost},
+      port => $Self->{auth}{smtpPort},
       ssl => 1,
       sasl_username => $Self->{auth}{username},
-      access_token => $Self->{auth}{access_token},
+      access_token => $Self->access_token(),
     })
   });
 }
 
-# read folder list from the server
-sub folders {
-  my $Self = shift;
-  $Self->connect_imap();
-  return $Self->{folders};
-}
-
-sub labels {
-  my $Self = shift;
-  $Self->connect_imap();
-  return $Self->{labels};
-}
-
-sub fetch_status {
-  my $Self = shift;
-  my $justfolders = shift;
-
-  my $imap = $Self->connect_imap();
-
-  my $folders = $Self->folders;
-  if ($justfolders) {
-    my %data = map { $_ => $folders->{$_} }
-               grep { exists $folders->{$_} }
-               @$justfolders;
-    $folders = \%data;
-  }
-
-  my $fields = "(uidvalidity uidnext highestmodseq messages)";
-  my $data = $imap->multistatus($fields, sort keys %$folders);
-
-  return $data;
-}
-
-sub fetch_folder {
+sub imap_labels {
   my $Self = shift;
   my $imapname = shift;
-  my $state = shift || { uidvalidity => 0 };
+  my $olduidvalidity = shift || 0;
+  my $uids = shift;
+  my $labels = shift;
 
   my $imap = $Self->connect_imap();
 
-  my $r = $imap->examine($imapname);
-  die "EXAMINE FAILED $r" unless (lc($r) eq 'ok' or lc($r) eq 'read-only');
+  my $r = $imap->select($imapname);
+  die "SELECT FAILED $imapname" unless $r;
 
-  my $uidvalidity = $imap->get_response_code('uidvalidity');
-  my $uidnext = $imap->get_response_code('uidnext');
-  my $highestmodseq = $imap->get_response_code('highestmodseq') || 0;
-  my $exists = $imap->get_response_code('exists') || 0;
+  my $uidvalidity = $imap->get_response_code('uidvalidity') + 0;
 
-  if ($state->{uidvalidity} != $uidvalidity) {
-    # force a delete/recreate and resync
-    $state = {
-      uidvalidity => $uidvalidity.
-      highestmodseq => 0,
-      uidnext => 0,
-      exists => 0,
-    };
+  my %res = (
+    imapname => $imapname,
+    olduidvalidity => $olduidvalidity,
+    newuidvalidity => $uidvalidity,
+  );
+
+  if ($olduidvalidity != $uidvalidity) {
+    return \%res;
   }
 
-  if ($highestmodseq and $highestmodseq == $state->{highestmodseq}) {
-    $Self->log('debug', "Nothing to do for $imapname at $highestmodseq");
-    return {}; # yay, nothing to do
-  }
+  $imap->store($uids, "x-gm-labels", "(@$labels)");
+  $Self->_unselect($imap);
 
-  my $changed = {};
-  if ($state->{uidnext} > 1) {
-    my $from = 1;
-    my $to = $state->{uidnext} - 1;
-    my @extra;
-    push @extra, "(changedsince $state->{highestmodseq})" if $state->{highestmodseq};
-    $Self->log('debug', "UPDATING $imapname: $from:$to");
-    $changed = $imap->fetch("$from:$to", "(uid flags x-gm-labels)", @extra) || {};
-  }
+  $res{updated} = $uids;
 
-  my $new = {};
-  if ($uidnext > $state->{uidnext}) {
-    my $from = $state->{uidnext};
-    my $to = $uidnext - 1; # or just '*'
-    $Self->log('debug', "FETCHING $imapname: $from:$to");
-    $new = $imap->fetch("$from:$to", '(uid flags internaldate envelope rfc822.size x-gm-msgid x-gm-thrid x-gm-labels)') || {};
-  }
-
-  my $alluids = undef;
-  if ($state->{exists} + scalar(keys %$new) > $exists) {
-    # some messages were deleted
-    my $from = 1;
-    my $to = $uidnext - 1;
-    # XXX - you could do some clever UID vs position queries to bisect this out, but it
-    # would need more data than we have here
-    $Self->log('debug', "COUNTING $imapname: $from:$to (something deleted)");
-    $alluids = $imap->search("UID", "$from:$to");
-  }
-
-  return {
-    oldstate => $state,
-    newstate => {
-      highestmodseq => $highestmodseq,
-      uidvalidity => $uidvalidity.
-      uidnext => $uidnext,
-      exists => $exists,
-    },
-    changed => $changed,
-    new => $new,
-    ($alluids ? (alluids => $alluids) : ()),
-  };
+  return \%res;
 }
+
 
 1;

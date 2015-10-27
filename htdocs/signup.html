@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+<link href='https://fonts.googleapis.com/css?family=Source+Sans+Pro:300,400,600,700,400italic' rel='stylesheet' type='text/css'>
+<link href="main.css" rel="stylesheet" type="text/css">
+<title>JMAP Proxy</title>
+</head>
+<body>
+<header>
+<div id="logo">JMAP</div>
+<ul id="nav" style="left:0">
+    <li class="nav-item"><a class="nav-link" href="http://jmap.io/index.html">Intro</a></li>
+    <li class="nav-item"><a class="nav-link" href="http://jmap.io/spec.html">The Spec</a> </li>
+    <li class="nav-item"><a class="nav-link" href="http://jmap.io/client.html">Using JMAP</a></li>
+    <li class="nav-item"><a class="nav-link" href="http://jmap.io/server.html">Implementing JMAP</a></li>
+    <li class="nav-item"><a class="nav-link" href="/">Try It</a></li>
+</ul>
+<a id="github" href="https://github.com/jmapio"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://s3.amazonaws.com/github/ribbons/forkme_right_darkblue_121621.png" alt="Fork me on GitHub"></a>
+</header>
+<article style="padding:0">
+
+<h1>Set hosts</h1>
+
+Please confirm host details below.
+
+<form action="/signup" method="post">
+<table border="1">
+<tr>
+  <th>IMAP</th>
+  <td>
+    <input type="text" name="imapHost" value="[% imapHost %]">
+    <input type="text" name="imapPort" width="5" value="[% imapPort %]">
+    <select name="imapSSL">
+     <option value="1"[% IF imapSSL == 1 %] selected[% END %]>Plaintext</option>
+     <option value="2"[% IF imapSSL == 2 %] selected[% END %]>SSL</option>
+     <option value="3"[% IF imapSSL == 3 %] selected[% END %]>StartTLS</option>
+    </select>
+  </td>
+</tr>
+<tr>
+  <th>SMTP</th>
+  <td>
+    <input type="text" name="smtpHost" value="[% smtpHost %]">
+    <input type="text" name="smtpPort" width="5" value="[% smtpPort %]">
+    <select name="smtpSSL">
+     <option value="1"[% IF smtpSSL == 1 %] selected[% END %]>Plaintext</option>
+     <option value="2"[% IF smtpSSL == 2 %] selected[% END %]>SSL</option>
+     <option value="3"[% IF smtpSSL == 3 %] selected[% END %]>StartTLS</option>
+    </select>
+  </td>
+</tr>
+<tr>
+  <th>CalDAV</th>
+  <td><input type="text" name="caldavURL" value="[% caldavURL %]"></td>
+</tr>
+<tr>
+  <th>CardDAV</th>
+  <td><input type="text" name="carddavURL" value="[% carddavURL %]"></td>
+</tr>
+<tr>
+  <th>Submit</th>
+  <td>
+    <input type="hidden" name="force" value="1">
+    <input type="hidden" name="username" value="[% username %]" />
+    <input type="hidden" name="password" value="[% password %]" />
+    <input type="submit" value="Create">
+  </td>
+</tr>
+</table>
+</form>
+
+</article>
+</body>
+</html>
