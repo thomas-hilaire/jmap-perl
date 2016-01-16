@@ -1150,6 +1150,7 @@ sub destroy_messages {
 
   my $folderdata = $Self->dget('ifolders');
   my %foldermap = map { $_->{ifolderid} => $_ } @$folderdata;
+  my %jmailmap = map { $_->{jmailboxid} => $_ } grep { $_->{jmailboxid} } @$folderdata;
 
   $Self->commit();
 
